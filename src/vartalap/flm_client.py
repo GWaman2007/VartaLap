@@ -81,23 +81,18 @@ Output decision:
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": self.config.max_tokens,
-            "temperature": self.config.temperature,
+            "max_tokens": 12,
+            "temperature": 0.0,
             "stream": True,
         }
 
-        headers = {
-            "Connection": "close",
-            "Content-Type": "application/json",
-        }
-
         try:
-            with self._http_client.stream("POST", self.endpoint, json=payload, headers=headers) as response:
+            with self._http_client.stream("POST", self.endpoint, json=payload) as response:
                 if response.status_code != 200:
                     t_end = time.perf_counter()
                     return FLMDecision(
                         action="error",
-                        raw_response=f"HTTP {response.status_code} - {response.text}",
+                        raw_response=f"HTTP {response.status_code}",
                         latency_ms=(t_end - t_start) * 1000,
                     )
 
@@ -116,57 +111,11 @@ Output decision:
                             if first_token_time is None:
                                 first_token_time = time.perf_counter()
                             collected_tokens.append(delta)
-                            text = "".join(collected_tokens).strip()
-
-                            # Single-Token Escape 1: <listen>
-                            if "<listen>" in text:
-                                t_end = time.perf_counter()
-                                ttft = (first_token_time - t_start) * 1000 if first_token_time else 0.0
-                                return FLMDecision(
-                                    action="listen",
-                                    utterance="",
-                                    latency_ms=(t_end - t_start) * 1000,
-                                    ttft_ms=ttft,
-                                    raw_response=text,
-                                )
-
-                            # Escape 2: <done>
-                            if "<done>" in text:
-                                t_end = time.perf_counter()
-                                ttft = (first_token_time - t_start) * 1000 if first_token_time else 0.0
-                                return FLMDecision(
-                                    action="done",
-                                    utterance="",
-                                    latency_ms=(t_end - t_start) * 1000,
-                                    ttft_ms=ttft,
-                                    raw_response=text,
-                                )
-
-                            # Escape 3: <talk> followed by words
-                            if "<talk>" in text:
-                                match = re.search(r"<talk>(.*?)(?:</talk>|\n|$)", text, re.DOTALL)
-                                if match:
-                                    talk_content = match.group(1).strip()
-                                    words = talk_content.split()
-                                    # Burst is limited to 3-4 words
-                                    if len(words) >= 3 or ("</talk>" in text and len(words) > 0):
-                                        burst_words = " ".join(words[:4])
-                                        t_end = time.perf_counter()
-                                        ttft = (first_token_time - t_start) * 1000 if first_token_time else 0.0
-                                        return FLMDecision(
-                                            action="talk",
-                                            utterance=burst_words,
-                                            latency_ms=(t_end - t_start) * 1000,
-                                            ttft_ms=ttft,
-                                            raw_response=text,
-                                        )
-
                     except Exception:
                         pass
 
         except Exception as e:
             t_end = time.perf_counter()
-            # Reset client after socket errors
             try:
                 self._http_client.close()
             except Exception:
@@ -178,15 +127,31 @@ Output decision:
                 latency_ms=(t_end - t_start) * 1000,
             )
 
-
         t_end = time.perf_counter()
         full_text = "".join(collected_tokens).strip()
         ttft = (first_token_time - t_start) * 1000 if first_token_time else 0.0
 
-        if "<talk>" in full_text:
+        # Parse decision from complete burst
+        if "<listen>" in full_text:
+            return FLMDecision(
+                action="listen",
+                utterance="",
+                latency_ms=(t_end - t_start) * 1000,
+                ttft_ms=ttft,
+                raw_response=full_text,
+            )
+        elif "<done>" in full_text:
+            return FLMDecision(
+                action="done",
+                utterance="",
+                latency_ms=(t_end - t_start) * 1000,
+                ttft_ms=ttft,
+                raw_response=full_text,
+            )
+        elif "<talk>" in full_text:
             match = re.search(r"<talk>(.*?)(?:</talk>|\n|$)", full_text, re.DOTALL)
-            words = (match.group(1).strip().split() if match else [])
-            burst_words = " ".join(words[:4]) if words else full_text.replace("<talk>", "").strip()
+            raw_words = match.group(1).strip().split() if match else []
+            burst_words = " ".join(raw_words[:4]) if raw_words else full_text.replace("<talk>", "").strip()
             return FLMDecision(
                 action="talk",
                 utterance=burst_words,
@@ -194,10 +159,15 @@ Output decision:
                 ttft_ms=ttft,
                 raw_response=full_text,
             )
-        elif "<done>" in full_text:
-            return FLMDecision(action="done", latency_ms=(t_end - t_start) * 1000, ttft_ms=ttft, raw_response=full_text)
         else:
-            return FLMDecision(action="listen", latency_ms=(t_end - t_start) * 1000, ttft_ms=ttft, raw_response=full_text)
+            return FLMDecision(
+                action="listen",
+                utterance="",
+                latency_ms=(t_end - t_start) * 1000,
+                ttft_ms=ttft,
+                raw_response=full_text,
+            )
+
 
     def close(self):
         self._http_client.close()
