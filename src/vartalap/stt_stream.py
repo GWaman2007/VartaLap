@@ -1,0 +1,152 @@
+import queue
+import threading
+import time
+from typing import Optional
+
+import numpy as np
+import sherpa_onnx
+
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
+
+from .config import VartalapConfig
+
+
+class SherpaSTTStream:
+    """Streaming Zipformer speech recognition using sherpa-onnx on a background thread."""
+
+    def __init__(self, config: Optional[VartalapConfig] = None):
+        self.config = config or VartalapConfig()
+        self.transcript_queue: queue.Queue[str] = queue.Queue()
+
+        self._recognizer: Optional[sherpa_onnx.OnlineRecognizer] = None
+        self._stream: Optional[sherpa_onnx.OnlineStream] = None
+        self._load_recognizer()
+
+        self._audio_queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._running = False
+        self._input_stream = None
+
+        self._current_partial = ""
+        self._last_emitted_text = ""
+        self._words_arrived_in_window = False
+        self.silence_tick_count = 0
+        self._lock = threading.Lock()
+
+        self._worker_thread: Optional[threading.Thread] = None
+
+    def _load_recognizer(self):
+        model_dir = self.config.stt_model_dir
+        tokens = str(model_dir / "tokens.txt")
+        encoder = str(model_dir / "encoder-epoch-99-avg-1.onnx")
+        decoder = str(model_dir / "decoder-epoch-99-avg-1.onnx")
+        joiner = str(model_dir / "joiner-epoch-99-avg-1.onnx")
+
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=tokens,
+            encoder=encoder,
+            decoder=decoder,
+            joiner=joiner,
+            num_threads=2,
+            sample_rate=self.config.sample_rate,
+            feature_dim=80,
+            decoding_method="greedy_search",
+        )
+        self._stream = self._recognizer.create_stream()
+
+    def start(self, device: Optional[int] = None):
+        """Starts real-time microphone capture and background STT decoding."""
+        self._running = True
+        self._worker_thread = threading.Thread(target=self._decoding_worker, daemon=True)
+        self._worker_thread.start()
+
+        if sd is not None:
+            def audio_callback(indata, frames, time_info, status):
+                if status:
+                    pass
+                if self._running:
+                    self._audio_queue.put(indata[:, 0].copy())
+
+            self._input_stream = sd.InputStream(
+                samplerate=self.config.sample_rate,
+                channels=self.config.channels,
+                dtype="float32",
+                blocksize=self.config.chunk_size_samples,
+                device=device,
+                callback=audio_callback,
+            )
+            self._input_stream.start()
+
+    def feed_audio_chunk(self, chunk: np.ndarray):
+        """Manually feed audio samples (for testing / mocking)."""
+        self._audio_queue.put(chunk)
+
+    def stop(self):
+        self._running = False
+        if self._input_stream:
+            self._input_stream.stop()
+            self._input_stream.close()
+            self._input_stream = None
+
+    def _decoding_worker(self):
+        while self._running:
+            try:
+                samples = self._audio_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            if self._stream is None or self._recognizer is None:
+                continue
+
+            self._stream.accept_waveform(self.config.sample_rate, samples)
+
+            while self._recognizer.is_ready(self._stream):
+                self._recognizer.decode_stream(self._stream)
+
+            result = self._recognizer.get_result(self._stream)
+            text = result.text.strip() if hasattr(result, "text") else ""
+
+            if text and text != self._last_emitted_text:
+                new_part = text[len(self._last_emitted_text):].strip()
+                if new_part:
+                    with self._lock:
+                        self._current_partial = text
+                        self._words_arrived_in_window = True
+                        for word in new_part.split():
+                            self.transcript_queue.put(word)
+                self._last_emitted_text = text
+
+            if self._recognizer.is_endpoint(self._stream):
+                self._recognizer.reset(self._stream)
+                self._last_emitted_text = ""
+
+    def check_silence_tick(self) -> int:
+        """Called every 500ms tick. Increments silence count if no new words arrived."""
+        with self._lock:
+            if self._words_arrived_in_window:
+                self.silence_tick_count = 0
+                self._words_arrived_in_window = False
+            else:
+                self.silence_tick_count += 1
+            return self.silence_tick_count
+
+    def get_current_partial(self) -> str:
+        with self._lock:
+            return self._current_partial
+
+    def reset_transcript(self):
+        """Resets partial transcript when turn ends."""
+        with self._lock:
+            self._current_partial = ""
+            self._last_emitted_text = ""
+            self.silence_tick_count = 0
+            self._words_arrived_in_window = False
+            if self._recognizer and self._stream:
+                self._recognizer.reset(self._stream)
+            while not self.transcript_queue.empty():
+                try:
+                    self.transcript_queue.get_nowait()
+                except Exception:
+                    break
