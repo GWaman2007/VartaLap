@@ -38,7 +38,7 @@ class PiperTTSPlayer:
         return self.voice.config.sample_rate if self.voice else 22050
 
     def play_burst(self, text: str, on_complete: Optional[Callable[[], None]] = None):
-        """Synthesize and queue a 3-4 word burst for playback."""
+        """Synthesize and queue a sentence/burst for playback."""
         clean_text = text.strip()
         if not clean_text:
             if on_complete:
@@ -49,8 +49,14 @@ class PiperTTSPlayer:
         self._playback_queue.put((clean_text, on_complete))
 
     def stop(self):
-        """Interrupt and clear any active playback."""
+        """Interrupt and cut active audio playback immediately."""
         self._stop_event.set()
+        # Direct hardware DAC cutoff for instant barge-in response
+        if sd is not None:
+            try:
+                sd.stop()
+            except Exception:
+                pass
         while not self._playback_queue.empty():
             try:
                 self._playback_queue.get_nowait()
@@ -86,7 +92,6 @@ class PiperTTSPlayer:
                         samples = np.concatenate(audio_arrays)
 
                         if sd is not None and not self._stop_event.is_set():
-                            # Play through sounddevice output stream
                             sd.play(samples, samplerate=self.sample_rate)
                             duration = len(samples) / self.sample_rate
                             start_time = time.perf_counter()
@@ -94,7 +99,7 @@ class PiperTTSPlayer:
                                 if self._stop_event.is_set():
                                     sd.stop()
                                     break
-                                time.sleep(0.02)
+                                time.sleep(0.015)
                             sd.stop()
 
             except Exception as e:

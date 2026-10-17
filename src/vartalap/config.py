@@ -13,9 +13,15 @@ class VartalapConfig:
     # STT Backend: "whisper" (FLM NPU) or "sherpa" (legacy)
     stt_backend: str = "whisper"
 
+    # Duplex & Barge-In Settings
+    echo_suppression: bool = False  # False for headsets/earphones (enables full duplex barge-in)
+    barge_in_rms_threshold: float = 0.035  # User speech RMS threshold to instantly cut off TTS
+    silence_duration_s: float = 0.45  # Silence window (seconds) to finalize user utterance
+    min_speech_duration_s: float = 0.25  # Minimum speech duration to transcribe
+
     # State Machine Timing
-    tick_interval_ms: int = 500  # 500ms evaluation ticks
-    silence_threshold_ticks: int = 2  # 2 ticks (1000ms) silence for <done> or turn yield
+    tick_interval_ms: int = 400  # 400ms evaluation ticks
+    silence_threshold_ticks: int = 2
 
     # Audio & STT Settings
     sample_rate: int = 16000

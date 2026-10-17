@@ -1,8 +1,7 @@
 """Whisper-V3-Turbo STT via FLM's /v1/audio/transcriptions endpoint.
 
-Instead of the tiny 20M Zipformer, this sends audio chunks to the Whisper-V3
-Turbo model running on the NPU via FLM. Uses simple energy-based VAD to
-detect speech boundaries and sends completed utterances for transcription.
+Uses energy-based VAD for speech boundary detection, sends completed utterances
+to Whisper-V3 Turbo on the NPU, and supports instant duplex barge-in detection.
 """
 
 import io
@@ -24,17 +23,16 @@ from .config import VartalapConfig
 
 
 class WhisperSTTStream:
-    """Streaming microphone capture with VAD-chunked Whisper transcription."""
-
-    # VAD Parameters
-    SPEECH_THRESHOLD = 0.02        # RMS threshold to consider as speech
-    SILENCE_DURATION_S = 0.6       # Seconds of silence to end an utterance
-    MIN_SPEECH_DURATION_S = 0.3    # Minimum speech duration to transcribe
-    MAX_SPEECH_DURATION_S = 15.0   # Maximum single utterance duration
+    """Streaming microphone capture with VAD-chunked Whisper transcription and duplex barge-in."""
 
     def __init__(self, config: Optional[VartalapConfig] = None):
         self.config = config or VartalapConfig()
         self.transcript_queue: queue.Queue[str] = queue.Queue()
+
+        # VAD Parameters from config
+        self.speech_threshold = self.config.barge_in_rms_threshold
+        self.silence_duration_s = self.config.silence_duration_s
+        self.min_speech_duration_s = self.config.min_speech_duration_s
 
         # Audio capture state
         self._audio_buffer: list[np.ndarray] = []
@@ -44,13 +42,16 @@ class WhisperSTTStream:
         self._running = False
         self._input_stream = None
 
+        # Duplex barge-in tracking
+        self._recent_rms: list[float] = []
+        self.last_audio_rms = 0.0
+        self.mute_mic = False
+
         # Transcription state
         self._current_partial = ""
         self._last_emitted_text = ""
         self._words_arrived_in_window = False
         self.silence_tick_count = 0
-        self.last_audio_rms = 0.0
-        self.mute_mic = False
         self._lock = threading.Lock()
 
         # Whisper HTTP client
@@ -76,13 +77,19 @@ class WhisperSTTStream:
                 if not self._running:
                     return
 
-                # Echo suppression: ignore audio while TTS is actively speaking
-                if self.mute_mic:
+                # If echo suppression is enabled and mic is muted, drop frames
+                if self.config.echo_suppression and self.mute_mic:
                     return
 
                 samples = indata[:, 0].copy()
                 rms = float(np.sqrt(np.mean(samples**2)))
                 self.last_audio_rms = rms
+
+                # Track recent RMS for instantaneous barge-in checks
+                with self._lock:
+                    self._recent_rms.append(rms)
+                    if len(self._recent_rms) > 5:
+                        self._recent_rms.pop(0)
 
                 if self.on_energy:
                     self.on_energy(rms)
@@ -99,14 +106,22 @@ class WhisperSTTStream:
             )
             self._input_stream.start()
 
+    def is_user_speaking(self) -> bool:
+        """Instantaneous energy-based check: returns True if recent audio indicates user is speaking."""
+        with self._lock:
+            if not self._recent_rms:
+                return False
+            # If at least 2 recent 100ms frames exceed barge-in threshold, user is actively speaking
+            speaking_frames = sum(1 for r in self._recent_rms if r >= self.speech_threshold)
+            return speaking_frames >= 2 or (self._recent_rms[-1] >= self.speech_threshold * 1.5)
+
     def _process_audio_chunk(self, samples: np.ndarray, rms: float):
         """VAD logic: detect speech start/end and queue completed utterances."""
         now = time.perf_counter()
-        is_speech = rms > self.SPEECH_THRESHOLD
+        is_speech = rms >= self.speech_threshold
 
         if is_speech:
             if not self._speech_started:
-                # Speech just started
                 self._speech_started = True
                 self._speech_start_time = now
                 self._audio_buffer = []
@@ -114,23 +129,20 @@ class WhisperSTTStream:
             self._audio_buffer.append(samples)
 
         elif self._speech_started:
-            # Still collecting audio during short silence gaps within speech
             self._audio_buffer.append(samples)
-
             speech_duration = now - self._speech_start_time
             silence_duration = now - self._last_speech_time
 
             # End of utterance: silence exceeded threshold
-            if silence_duration >= self.SILENCE_DURATION_S:
-                if speech_duration >= self.MIN_SPEECH_DURATION_S and self._audio_buffer:
-                    # Concatenate all audio and send to Whisper
+            if silence_duration >= self.silence_duration_s:
+                if speech_duration >= self.min_speech_duration_s and self._audio_buffer:
                     full_audio = np.concatenate(self._audio_buffer)
                     self._transcribe_queue.put(full_audio)
                 self._speech_started = False
                 self._audio_buffer = []
 
-            # Force-end extremely long utterances
-            elif speech_duration >= self.MAX_SPEECH_DURATION_S:
+            # Force-end extremely long utterances (over 12 seconds)
+            elif speech_duration >= 12.0:
                 if self._audio_buffer:
                     full_audio = np.concatenate(self._audio_buffer)
                     self._transcribe_queue.put(full_audio)
@@ -165,44 +177,57 @@ class WhisperSTTStream:
 
     def _transcribe_with_whisper(self, audio: np.ndarray) -> str:
         """Send audio to FLM's Whisper /v1/audio/transcriptions endpoint."""
-        # Convert float32 audio to 16-bit PCM WAV bytes
         wav_bytes = self._audio_to_wav_bytes(audio)
 
         try:
             response = self._http_client.post(
                 self._whisper_url,
                 files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                data={
-                    "model": "whisper-v3:turbo",
-                    "language": "en",
-                    "response_format": "json",
-                },
+                data={"model": "whisper-v3:turbo"},
             )
             if response.status_code == 200:
-                result = response.json()
-                text = result.get("text", "").strip()
-                # Filter out common Whisper hallucinations on silence
-                if text.lower() in ("", "you", ".", "...", "thank you.",
-                                     "thanks for watching!", "thank you for watching.",
-                                     "subscribe", "bye."):
+                try:
+                    result = response.json()
+                except Exception:
                     return ""
+
+                if not isinstance(result, dict):
+                    return ""
+
+                text = (result.get("text", "") or "").strip()
+                if not text:
+                    return ""
+
+                # Clean unicode replacement characters
+                text = text.replace("\ufffd", "").strip()
+
+                # Filter out repetitive character/word hallucinations (e.g. "E a E a E a")
+                words = text.split()
+                if len(words) >= 4 and len(set(words)) <= 2:
+                    return ""
+
+                # Filter common Whisper silence hallucinations
+                hallucinations = {
+                    "you", ".", "...", "thank you.", "thank you",
+                    "thanks for watching!", "thank you for watching.",
+                    "subscribe", "bye.", "bye", "e", "a", "so", "oh",
+                }
+                if text.lower() in hallucinations:
+                    return ""
+
                 return text
             else:
-                print(f"[Whisper HTTP {response.status_code}] {response.text[:200]}")
                 return ""
-        except Exception as e:
-            print(f"[Whisper Request Error] {e}")
+        except Exception:
             return ""
 
     def _audio_to_wav_bytes(self, audio: np.ndarray) -> bytes:
-        """Convert float32 numpy audio array to WAV file bytes."""
-        # Clamp and convert to int16
+        """Convert float32 numpy audio array to 16kHz 16-bit mono WAV bytes."""
         audio_clamped = np.clip(audio, -1.0, 1.0)
         pcm_data = (audio_clamped * 32767).astype(np.int16)
 
-        # Build WAV header manually (simpler than importing wave)
         num_samples = len(pcm_data)
-        data_size = num_samples * 2  # 16-bit = 2 bytes per sample
+        data_size = num_samples * 2
         sample_rate = self.config.sample_rate
         channels = 1
         bits_per_sample = 16
@@ -210,20 +235,17 @@ class WhisperSTTStream:
         block_align = channels * bits_per_sample // 8
 
         buf = io.BytesIO()
-        # RIFF header
         buf.write(b"RIFF")
         buf.write(struct.pack("<I", 36 + data_size))
         buf.write(b"WAVE")
-        # fmt chunk
         buf.write(b"fmt ")
-        buf.write(struct.pack("<I", 16))  # chunk size
-        buf.write(struct.pack("<H", 1))   # PCM format
+        buf.write(struct.pack("<I", 16))
+        buf.write(struct.pack("<H", 1))
         buf.write(struct.pack("<H", channels))
         buf.write(struct.pack("<I", sample_rate))
         buf.write(struct.pack("<I", byte_rate))
         buf.write(struct.pack("<H", block_align))
         buf.write(struct.pack("<H", bits_per_sample))
-        # data chunk
         buf.write(b"data")
         buf.write(struct.pack("<I", data_size))
         buf.write(pcm_data.tobytes())
@@ -250,7 +272,7 @@ class WhisperSTTStream:
             pass
 
     def check_silence_tick(self) -> int:
-        """Called every tick. Increments silence count if no new words arrived."""
+        """Called on tick. Increments silence count if no new words arrived."""
         with self._lock:
             if self._words_arrived_in_window:
                 self.silence_tick_count = 0

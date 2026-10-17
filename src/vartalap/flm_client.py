@@ -26,11 +26,12 @@ class FLMClient:
     PROMPT_TEMPLATE = """You are Vartalap, an intelligent real-time conversational voice assistant.
 
 Rules:
-1. SAFETY FIRST: If the user is about to do something DANGEROUS (mixing chemicals, touching live wires, self-harm, etc), IMMEDIATELY output <talk> followed by a clear warning of 10-20 words explaining WHY it is dangerous.
-   Example: <talk>Stop immediately! Sodium reacts violently with water causing an explosion and severe burns.
-2. If the user is mid-sentence and still speaking, output ONLY: <listen>
-3. If the user has finished speaking (silence >= 2 ticks) and asked a question or said something that warrants a response, output <talk> followed by a natural, helpful response of 10-25 words. Speak in complete sentences.
-4. If you have already fully answered and the user is silent, output: <done>
+1. SAFETY FIRST: If the user is about to do something DANGEROUS (mixing chemicals, touching live wires, self-harm, etc), IMMEDIATELY output <talk> followed by an urgent warning in 10-25 words explaining WHY it is dangerous.
+   Example: <talk>Stop immediately! Sodium reacts violently with water causing an explosion, intense heat, and severe burns.
+2. If the user tells you to stop, wait, or be quiet, acknowledge politely in 5-10 words:
+   Example: <talk>I have stopped. What would you like to know?
+3. If the user spoke to you or asked a question, output <talk> followed by a natural, direct, conversational answer in 10-25 words. Speak in complete sentences.
+4. If you have already fully answered the user and they have not said anything new, output: <done>
 5. Do NOT repeat what you already said. Build on the conversation naturally.
 
 Conversation History:
@@ -43,7 +44,6 @@ Your Previous Response: "{agent_last_chunk}"
 
 Output decision:
 """
-
 
     def __init__(self, config: Optional[VartalapConfig] = None):
         self.config = config or VartalapConfig()
@@ -71,7 +71,7 @@ Output decision:
         silence_tick_count: int,
         agent_last_chunk: str,
     ) -> FLMDecision:
-        """Evaluates the state using streaming with single-token escape."""
+        """Evaluates conversational state with streaming token reading."""
         prompt = self.format_prompt(
             history=history,
             current_partial_transcript=current_partial_transcript,
@@ -87,7 +87,7 @@ Output decision:
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self.config.max_tokens,
-            "temperature": 0.0,
+            "temperature": self.config.temperature,
             "stream": True,
         }
 
@@ -117,7 +117,7 @@ Output decision:
                                 first_token_time = time.perf_counter()
                             collected_tokens.append(delta)
 
-                            # Early exit: if we see <listen> or <done>, no need to wait
+                            # Early exit on single control tokens
                             partial = "".join(collected_tokens).strip()
                             if "<listen>" in partial or "<done>" in partial:
                                 break
@@ -141,7 +141,7 @@ Output decision:
         full_text = "".join(collected_tokens).strip()
         ttft = (first_token_time - t_start) * 1000 if first_token_time else 0.0
 
-        # Parse decision from complete response
+        # Decision extraction
         if "<listen>" in full_text:
             return FLMDecision(
                 action="listen",
@@ -161,10 +161,9 @@ Output decision:
         elif "<talk>" in full_text:
             match = re.search(r"<talk>(.*?)(?:</talk>|\n|$)", full_text, re.DOTALL)
             utterance = match.group(1).strip() if match else full_text.replace("<talk>", "").strip()
-            # Clean up any residual tags
-            utterance = utterance.replace("<done>", "").replace("<listen>", "").strip()
+            utterance = utterance.replace("<done>", "").replace("<listen>", "").replace("</talk>", "").strip()
             if not utterance:
-                utterance = full_text.replace("<talk>", "").replace("<done>", "").replace("<listen>", "").strip()
+                utterance = full_text.replace("<talk>", "").replace("<done>", "").replace("<listen>", "").replace("</talk>", "").strip()
             return FLMDecision(
                 action="talk",
                 utterance=utterance,
@@ -173,6 +172,16 @@ Output decision:
                 raw_response=full_text,
             )
         else:
+            # If model answered directly without <talk> tag
+            clean_text = full_text.strip()
+            if clean_text:
+                return FLMDecision(
+                    action="talk",
+                    utterance=clean_text,
+                    latency_ms=(t_end - t_start) * 1000,
+                    ttft_ms=ttft,
+                    raw_response=full_text,
+                )
             return FLMDecision(
                 action="listen",
                 utterance="",
@@ -180,7 +189,6 @@ Output decision:
                 ttft_ms=ttft,
                 raw_response=full_text,
             )
-
 
     def close(self):
         self._http_client.close()
