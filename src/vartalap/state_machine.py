@@ -63,9 +63,12 @@ class VartalapStateMachine:
     def stop(self):
         """Stops the state machine and audio streams."""
         self._running = False
+        if self._loop_thread and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=1.0)
         self.tts.stop()
         self.stt.stop()
         self.flm.close()
+
 
     def _run_loop(self):
         """Main event-driven loop executing the 4 states."""
@@ -138,6 +141,8 @@ class VartalapStateMachine:
 
     def _handle_arbitration(self):
         """STATE: ARBITRATION - Check STT buffer & silence ticks."""
+        t_tick_start = time.perf_counter()
+
         silence_ticks = self.stt.check_silence_tick()
         current_partial = self.stt.get_current_partial()
 
@@ -167,6 +172,12 @@ class VartalapStateMachine:
             # Turn is completely done, sleep to IDLE
             self._finalize_turn()
             self.set_state(VartalapState.IDLE)
+        else:
+            # On error or transient state, wait before retrying
+            elapsed = time.perf_counter() - t_tick_start
+            sleep_time = max(0.0, (self.config.tick_interval_ms / 1000.0) - elapsed)
+            time.sleep(sleep_time)
+
 
     def _start_speech_burst(self, text: str):
         """Initiates Piper TTS playback for 3-4 words."""
