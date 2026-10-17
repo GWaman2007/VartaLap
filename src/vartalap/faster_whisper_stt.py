@@ -216,6 +216,11 @@ class FasterWhisperSTTStream:
                 self.silence_tick_count += 1
             return self.silence_tick_count
 
+    @property
+    def is_speaking(self) -> bool:
+        """Returns True if the user is currently speaking (audio above threshold)."""
+        return self._speech_started
+
     def get_current_partial(self) -> str:
         with self._lock:
             return self._current_partial

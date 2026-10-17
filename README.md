@@ -1,164 +1,115 @@
 # 🎙️ Vartalap (वार्तालाप)
 
-**Ultra-Low Latency Real-Time Conversational Monitor & Turn-Taking Harness**
+**Ultra-Low Latency Real-Time Conversational Voice Assistant & Duplex Turn Monitor**
 
-Vartalap is a voice turn-taking and conversational monitoring architecture designed for instant conversational awareness. By coupling **NPU-accelerated edge language models (FastFlowLM / Gemma)** with streaming speech-to-text (**sherpa-onnx Zipformer**) and lightweight streaming neural speech synthesis (**Piper TTS**), Vartalap achieves sub-80ms decision latency with minimal compute overhead when idle.
+Vartalap is a voice turn-taking and real-time conversational monitor designed for ultra-low latency conversational voice interaction on edge devices (AMD Ryzen AI NPU + Zen 5 CPU).
+
+By coupling **Faster-Whisper (INT8 CPU via CTranslate2, ~150–220ms)** with **FastFlowLM (`gemma4-it:e2b` on Ryzen AI NPU)** and **Piper Neural TTS**, Vartalap achieves instant conversational responsiveness with zero pauses and zero NPU compute overhead while idle.
 
 ---
 
-## 🏛️ State Machine Architecture
+## 🏛️ Architecture & Hardware Distribution
 
-Vartalap operates on an event-driven 4-state finite state machine with zero NPU/LLM inference while dormant.
+| Component | Engine | Hardware Tier | Latency | Role |
+| :--- | :--- | :--- | :--- | :--- |
+| **STT** | Faster-Whisper (`tiny.en`, INT8) | AMD Zen 5 CPU (4 threads) | ~150–220ms | Continuous rolling transcription every 400ms |
+| **LLM** | FastFlowLM (`gemma4-it:e2b`) | AMD Ryzen AI NPU (port 52625) | ~1.1s TTFT | Real-time turn evaluation & streaming pieces |
+| **TTS** | Piper ONNX Neural TTS (`lessac`) | CPU Neural Synthesis | ~40ms burst | Clause/sentence burst playback |
+| **UI** | FastAPI + WebSockets + Canvas Orb | Browser / Localhost | < 5ms sync | Procedural voice orb, pipeline flow, audio selectors |
 
-```
+---
+
+## ⚡ 4-State Turn Pipeline
+
+```text
                          ┌─────────────────────────────┐
                          │         STATE: IDLE         │
-                         │ (Zero NPU/LLM inference)    │
-                         │ Harness waits for STT word  │
+                         │ (0% NPU / LLM inference)    │
+                         │ Waiting for first speech    │
                          └──────────────┬──────────────┘
                                         │
-                               [User speaks a word]
+                         [Speech detected / 400ms chunk]
                                         │
                                         ▼
                          ┌─────────────────────────────┐
                          │      STATE: MONITORING      │
-                         │ Evaluates at 500ms ticks    │
+                         │ Continuous Whisper stream   │
+                         │ FastFlowLM NPU evaluation   │
                          └──────┬───────────────┬──────┘
                                 │               │
-                        User Speaking    Silence x2 Ticks
+                    Sentence Unfinished   Complete Query
                                 │               │
-                     ┌──────────┴──────┐        │
-                     ▼                 ▼        ▼
-                 <listen>           <talk>   <talk>
-                 (Remain quiet)        │        │
-                                       ▼        ▼
+                                ▼               ▼
+                             <listen>        <talk>
+                         (Keep listening)       │
+                                                ▼
                          ┌─────────────────────────────┐
                          │       STATE: TALKING        │
-                         │  Stream 3-4 words to Piper  │
+                         │  Stream clause 1 to Piper   │
+                         │  Piper speaks while clause  │
+                         │  2 generates on NPU         │
                          └──────────────┬──────────────┘
                                         │
-                         [3-4 words playback complete]
+                               [Playback finishes]
                                         │
                                         ▼
                          ┌─────────────────────────────┐
-                         │    STATE: ARBITRATION       │
-                         │  Check STT buffer & silence │
-                         └──────┬───────────────┬──────┘
-                                │               │
-                    User spoke / Unfinished   Model finished &
-                                │             User silent x2 ticks
-                                ▼               │
-                       Gemma evaluates:         ▼
-                      <talk> or <listen>     <done>
-                                                │
-                                                ▼
-                                         Return to IDLE
+                         │     STATE: ARBITRATION      │
+                         │ Turn yield check & clean    │
+                         │ commit to history           │
+                         └──────────────┬──────────────┘
+                                        │
+                                        ▼
+                                  Return to IDLE
 ```
 
 ---
 
-## ⚡ Core Philosophy & States
+## 🎯 Conversational Rules
 
-1. **`IDLE` (Dormant Sleep):**
-   - Zero NPU / LLM generation.
-   - Streaming Zipformer STT runs on a background thread monitoring microphone audio.
-   - The harness transitions to `MONITORING` immediately when the first spoken word is detected.
-
-2. **`MONITORING` (500ms Tick Evaluation):**
-   - Ticks every 500ms.
-   - Evaluates partial STT transcripts with FastFlowLM (FLM) under strict regex constraints (`^(<listen>|<talk>|<done>)`).
-   - If output is `<listen>`: Discard token, remain quiet, wait for the next tick (single-token escape latency $< 80\text{ ms}$).
-   - If output is `<talk>`: Collect next 3–4 tokens, stream them to Piper TTS, transition to `TALKING`.
-
-3. **`TALKING` (Burst Speech Output):**
-   - Synthesize and stream 3–4 words to the audio output device.
-   - STT audio capture continues concurrently in the background.
-   - Transitions to `ARBITRATION` upon completing playback of the burst.
-
-4. **`ARBITRATION` (Interruption & Yield Check):**
-   - Checks if user spoke during playback:
-     - User spoke / unfinished thought: Append words to context, query Gemma whether to continue `<talk>` or back off with `<listen>`.
-     - Model finished and user silent for 2 ticks: Gemma outputs `<done>` to yield turn and return to `IDLE`.
-
----
-
-## 🎯 Prompt Template & Regex Constraint
-
-Decoding is constrained to the regex: `^(<listen>|<talk>|<done>)`
-
-```text
-You are Vartalap, an ultra-low latency real-time conversational monitor.
-Rules:
-1. If the user is speaking correctly mid-thought, output: <listen>
-2. If you need to speak (answer or correct), output: <talk> followed by at most 4 words.
-3. If you have completely finished speaking and the user has been silent for 2 turns, output: <done>
-
-Conversation History:
-{history}
-
-[Current State]
-User Audio: "{current_partial_transcript}"
-User Silence Ticks: {silence_tick_count}
-Your Last Partial Utterance: "{agent_last_chunk}"
-
-Output decision:
-```
-
----
-
-## 📦 Tech Stack & Requirements
-
-- **Inference Runtime:** [FastFlowLM (FLM)](https://github.com/) serving NPU-optimized models (e.g., `gemma4-it:e2b`, `qwen3.5:4b`) on port `52625`.
-- **Speech-to-Text (STT):** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with streaming Zipformer transducer.
-- **Text-to-Speech (TTS):** [Piper](https://github.com/rhasspy/piper) ultra-fast local neural TTS.
-- **Audio I/O:** `sounddevice` / `numpy` running real-time streaming circular buffers.
-- **Python:** 3.10+ (managed via `uv` or `pip`).
+Decoding is strictly governed by stateful conversational rules:
+1. **Safety First:** If dangerous actions are detected (e.g. live wires, chemical reactions, self-harm), outputs `<talk>` with an immediate safety warning.
+2. **Unfinished / Incomplete Speech:** If the user utterance is incomplete, trailing off, or missing a main clause (*"so like"*, *"rice in relation to the"*, *"and then"*), outputs ONLY `<listen>`.
+3. **Greetings & Audio Checks:** If the user says *"hello"*, *"can you hear me?"*, or *"are you there?"*, outputs `<talk>` with an immediate warm confirmation.
+4. **Complete Questions & Commands:** Once the query is complete, outputs `<talk>` followed by a direct, concise 10–25 word answer.
+5. **Turn Completion:** Yields with `<done>` only after the full answer has been spoken and the user is silent.
 
 ---
 
 ## 🚀 Quickstart
 
-### 1. Clone & Setup Environment
+### 1. Prerequisites
+- Windows 11 with AMD Ryzen AI processor (or modern CPU).
+- Python 3.10+ (managed via `.venv` or `uv`).
+- FastFlowLM installed:
+  ```powershell
+  flm pull gemma4-it:e2b
+  flm serve gemma4-it:e2b -s 50
+  ```
 
-```bash
-git clone https://github.com/GWaman2007/VartaLap.git
-cd VartaLap
-
-# Create virtual environment with uv or python
-uv venv
-.venv\Scripts\activate
-uv pip install -r requirements.txt
+### 2. Launch Vartalap Modern Web Dashboard
+```powershell
+.\run.ps1 --ui
 ```
+- Automatically opens **http://127.0.0.1:8000**.
+- Features an interactive **Procedural Canvas Voice Orb**, real-time audio VU meters, latency telemetry, pipeline visualizer, and microphone/headphone selectors.
+- Click **▶ START VARTALAP** to begin duplex voice conversation.
 
-### 2. Start FLM Model Server
+### 3. Launch Terminal CLI
+```powershell
+# List available audio devices
+.\run.ps1 --list-devices
 
-```bash
-# Pull model (if not already downloaded)
-flm pull gemma4-it:e2b
-
-# Start local server
-flm serve gemma4-it:e2b --pmode performance
-```
-
-### 3. Run Vartalap
-
-```bash
-python -m vartalap.main
+# Run with specific microphone and output device index
+.\run.ps1 --mic 2 --out 4
 ```
 
 ---
 
-## 📊 Performance Benchmarks & Targets
+## 🧪 Testing
 
-| Metric | Target | Notes |
-| :--- | :--- | :--- |
-| **Single-token escape (`<listen>`)** | $< 80\text{ ms}$ | First-token latency on NPU; halts generation immediately |
-| **Idle CPU / NPU utilization** | $\sim 0\%$ | Zero LLM calls until STT word arrives |
-| **STT streaming word latency** | $< 120\text{ ms}$ | Sherpa-onnx Zipformer continuous chunking |
-| **TTS burst time-to-audio** | $< 100\text{ ms}$ | 3–4 word chunk synthesized by Piper |
-
----
-
-## 📜 License
-
-MIT License.
+Run the full pytest suite:
+```powershell
+pytest tests/
+```
+All unit tests verify state transitions, streaming piece generation, and turn-yield protections.

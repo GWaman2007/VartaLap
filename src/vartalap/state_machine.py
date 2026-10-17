@@ -114,6 +114,8 @@ class VartalapStateMachine:
 
         silence_ticks = self.stt.check_silence_tick()
         current_partial = self.stt.get_current_partial()
+        is_spk = getattr(self.stt, "is_speaking", False)
+        speech_status = "Speaking (sentence in progress)" if is_spk else "Finished speaking"
 
         # Stream pieces directly to TTS playback as soon as each sentence/clause is ready
         def on_burst_piece(piece: str):
@@ -129,6 +131,7 @@ class VartalapStateMachine:
             silence_tick_count=silence_ticks,
             agent_last_chunk=self.agent_last_chunk,
             on_piece=on_burst_piece,
+            user_speech_status=speech_status,
         )
 
         if self.on_decision:

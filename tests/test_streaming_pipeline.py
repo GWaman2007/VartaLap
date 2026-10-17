@@ -16,7 +16,7 @@ def test_streaming_pieces_burst():
     tts_mock = MagicMock()
 
     # Simulate streaming callback emitting two pieces
-    def mock_eval_stream(history, current_partial_transcript, silence_tick_count, agent_last_chunk, on_piece=None):
+    def mock_eval_stream(history, current_partial_transcript, silence_tick_count, agent_last_chunk, on_piece=None, **kwargs):
         if on_piece:
             on_piece("The President of India is Ram Nath Kovind,")
             on_piece("and the Prime Minister is Narendra Modi.")

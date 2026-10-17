@@ -30,12 +30,13 @@ class FLMClient:
     PROMPT_TEMPLATE = """You are Vartalap, a fast, helpful real-time conversational voice assistant.
 
 Rules:
-1. GREETINGS & CHECK-INS: If user greets you ("hello", "hi", "hey") or checks if you can hear them ("can you hear me?", "you hear me?", "are you there?"), ALWAYS output <talk> followed by a warm, direct confirmation.
-   Example: <talk>Hello! Yes, I hear you loud and clear. How can I assist you today?
-2. SAFETY FIRST: If user proposes something dangerous (live wires, chemicals in water, self-harm), output <talk> with an urgent warning in 10-20 words explaining WHY it is dangerous.
+1. SAFETY FIRST: If user proposes something dangerous (live wires, chemicals in water, self-harm), output <talk> with an urgent warning.
    Example: <talk>Stop immediately! Sodium reacts violently with water, causing an explosion, intense heat, and severe burns.
-3. COMPLETE QUESTIONS & STATEMENTS: If user asked a question, made a request, or made a statement, output <talk> followed by a concise, direct, helpful answer in 10-25 words in complete sentences.
-4. INCOMPLETE SPEECH: Output ONLY <listen> if the user utterance is clearly cut off mid-sentence (e.g. "and then I went to the...", "because of...").
+2. UNFINISHED / INCOMPLETE SENTENCES: If the user utterance feels unfinished, incomplete, mid-thought, trailing off, or missing a main clause (e.g. "so like", "what is the...", "in relation to the", "because I was", "and then", "if I have"), output ONLY: <listen>
+   Do NOT interrupt the user. Do NOT ask them to clarify or finish. Simply output <listen>.
+3. GREETINGS & CHECK-INS: If user greets you ("hello", "hi", "hey") or checks if you can hear them ("can you hear me?", "you hear me?", "are you there?"), output <talk> followed by a warm, direct confirmation.
+   Example: <talk>Hello! Yes, I hear you loud and clear. How can I assist you today?
+4. COMPLETE QUESTIONS & STATEMENTS: ONLY if the user has fully finished speaking a complete, grammatically sound question or statement with a clear end, output <talk> followed by a concise, direct answer in 10-25 words.
 5. TURN COMPLETION: Output <done> ONLY when you have already given your complete spoken answer and user has not said anything new.
 
 Conversation History:
@@ -43,7 +44,7 @@ Conversation History:
 
 [Current State]
 User Said: "{current_partial_transcript}"
-Agent Already Answered: {agent_has_answered}
+User Speech Status: {speech_status}
 
 Output decision:
 """
@@ -61,8 +62,9 @@ Output decision:
         self,
         history: str,
         current_partial_transcript: str,
-        silence_tick_count: int,
-        agent_last_chunk: str,
+        silence_tick_count: int = 0,
+        agent_last_chunk: str = "",
+        user_speech_status: str = "Finished speaking",
     ) -> str:
         clean_history = history.strip()
         if clean_history:
@@ -72,12 +74,10 @@ Output decision:
         else:
             clean_history = "None"
 
-        has_answered = "Yes" if agent_last_chunk else "No"
-
         return self.PROMPT_TEMPLATE.format(
             history=clean_history,
             current_partial_transcript=current_partial_transcript.strip(),
-            agent_has_answered=has_answered,
+            speech_status=user_speech_status,
         )
 
     def evaluate_stream(
@@ -87,6 +87,7 @@ Output decision:
         silence_tick_count: int,
         agent_last_chunk: str,
         on_piece: Optional[Callable[[str], None]] = None,
+        user_speech_status: str = "Finished speaking",
     ) -> FLMDecision:
         """Evaluates conversational state with streaming token reading and piece bursting.
         
@@ -99,6 +100,7 @@ Output decision:
             current_partial_transcript=current_partial_transcript,
             silence_tick_count=silence_tick_count,
             agent_last_chunk=agent_last_chunk,
+            user_speech_status=user_speech_status,
         )
 
         t_start = time.perf_counter()
@@ -145,14 +147,17 @@ Output decision:
 
                             if action is None:
                                 tag_buffer += delta
-                                if "<listen>" in tag_buffer:
+                                if "<listen" in tag_buffer:
                                     action = "listen"
-                                elif "<done>" in tag_buffer:
+                                elif "<done" in tag_buffer:
                                     action = "done"
-                                elif "<talk>" in tag_buffer:
+                                elif "<talk" in tag_buffer:
                                     action = "talk"
                                     in_talk = True
-                                    remainder = tag_buffer.split("<talk>", 1)[1]
+                                    if "<talk>" in tag_buffer:
+                                        remainder = tag_buffer.split("<talk>", 1)[1]
+                                    else:
+                                        remainder = tag_buffer.split(">", 1)[1] if ">" in tag_buffer else ""
                                     if remainder:
                                         current_piece.append(remainder)
                                 elif len(tag_buffer) > 15:
@@ -162,9 +167,9 @@ Output decision:
                                     current_piece.append(tag_buffer)
 
                             elif in_talk:
-                                if "</talk>" in delta or "<done>" in delta:
+                                if "</talk>" in delta or "<done" in delta or "<listen" in delta:
                                     in_talk = False
-                                    clean_delta = delta.replace("</talk>", "").replace("<done>", "")
+                                    clean_delta = delta.replace("</talk>", "").replace("<done>", "").replace("<listen>", "").strip()
                                     if clean_delta:
                                         current_piece.append(clean_delta)
                                 else:
@@ -182,7 +187,7 @@ Output decision:
 
             # Emit any remaining text in the piece buffer
             if on_piece and current_piece:
-                remaining = "".join(current_piece).replace("</talk>", "").replace("<done>", "").strip()
+                remaining = "".join(current_piece).replace("</talk>", "").replace("<done>", "").replace("<listen>", "").strip()
                 if remaining:
                     on_piece(remaining)
 
@@ -191,9 +196,9 @@ Output decision:
             latency = (t_end - t_start) * 1000
             ttft = (first_token_time - t_start) * 1000 if first_token_time else latency
 
-            if action == "listen" or "<listen>" in full_text:
+            if action == "listen" or "<listen" in full_text:
                 return FLMDecision(action="listen", utterance="", latency_ms=latency, ttft_ms=ttft, raw_response=full_text)
-            elif action == "done" or "<done>" in full_text:
+            elif action == "done" or "<done" in full_text:
                 return FLMDecision(action="done", utterance="", latency_ms=latency, ttft_ms=ttft, raw_response=full_text)
             else:
                 utterance = full_text.replace("<talk>", "").replace("</talk>", "").replace("<done>", "").replace("<listen>", "").strip()
