@@ -21,7 +21,7 @@ class VartalapStateMachine:
     
     Supports Whisper (FLM NPU) and Sherpa-ONNX STT backends.
     Features instant hardware-level duplex barge-in (TTS cancellation
-    on user voice activity) and natural multi-turn responses.
+    on user voice activity) and continuous streaming evaluation.
     """
 
     def __init__(
@@ -106,7 +106,7 @@ class VartalapStateMachine:
             pass
 
     def _handle_monitoring(self):
-        """STATE: MONITORING - Evaluates state to decide listen/talk/done."""
+        """STATE: MONITORING - Evaluates streaming audio to decide listen/talk/done."""
         t_tick_start = time.perf_counter()
 
         silence_ticks = self.stt.check_silence_tick()
@@ -145,26 +145,30 @@ class VartalapStateMachine:
     def _handle_talking(self):
         """STATE: TALKING - Monitor TTS playback and detect real-time barge-in."""
         self._barge_in_detected.clear()
+        start_time = time.perf_counter()
 
         # Poll every 15ms for playback completion or instant user speech
         while not self._playback_finished_event.is_set():
-            # Check 1: User speech energy spike (instant 30ms hardware cutoff)
-            energy_barge_in = hasattr(self.stt, "is_user_speaking") and self.stt.is_user_speaking()
-            # Check 2: Transcribed words already arrived
-            words_barge_in = not self.stt.transcript_queue.empty()
+            now = time.perf_counter()
+            # 250ms grace period after starting playback to prevent DAC transients from self-interrupting
+            if (now - start_time) > 0.25:
+                # Check 1: User speech energy spike (RMS >= barge_in_rms_threshold)
+                energy_barge_in = hasattr(self.stt, "is_user_speaking") and self.stt.is_user_speaking()
+                # Check 2: Transcribed words already arrived
+                words_barge_in = not self.stt.transcript_queue.empty()
 
-            if energy_barge_in or words_barge_in:
-                # INSTANT BARGE-IN: Stop TTS immediately!
-                self.tts.stop()
-                self._playback_finished_event.set()
-                self._barge_in_detected.set()
+                if energy_barge_in or words_barge_in:
+                    # INSTANT BARGE-IN: Stop TTS immediately!
+                    self.tts.stop()
+                    self._playback_finished_event.set()
+                    self._barge_in_detected.set()
 
-                if self.on_barge_in:
-                    self.on_barge_in()
+                    if self.on_barge_in:
+                        self.on_barge_in()
 
-                self._finalize_turn()
-                self.set_state(VartalapState.MONITORING)
-                return
+                    self._finalize_turn()
+                    self.set_state(VartalapState.MONITORING)
+                    return
 
             time.sleep(0.015)
 

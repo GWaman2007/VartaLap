@@ -7,20 +7,21 @@ class VartalapConfig:
     # FastFlowLM Settings
     flm_base_url: str = "http://127.0.0.1:52625/v1"
     model_name: str = "gemma4-it:e2b"
-    max_tokens: int = 40  # Allow 15-25 word natural responses
-    temperature: float = 0.1
+    max_tokens: int = 35  # Natural 12-25 word conversational answers
+    temperature: float = 0.0  # Deterministic, lowest latency
 
     # STT Backend: "whisper" (FLM NPU) or "sherpa" (legacy)
     stt_backend: str = "whisper"
 
-    # Duplex & Barge-In Settings
-    echo_suppression: bool = False  # False for headsets/earphones (enables full duplex barge-in)
-    barge_in_rms_threshold: float = 0.035  # User speech RMS threshold to instantly cut off TTS
-    silence_duration_s: float = 0.45  # Silence window (seconds) to finalize user utterance
-    min_speech_duration_s: float = 0.25  # Minimum speech duration to transcribe
+    # Duplex & Barge-In Audio Levels
+    echo_suppression: bool = False  # False for headsets (allows full duplex barge-in)
+    speech_threshold_rms: float = 0.050  # Start VAD speech buffer (background is ~0.038, speech is 0.09-0.20)
+    barge_in_rms_threshold: float = 0.080  # Intentional user interruption threshold during TTS
+    silence_duration_s: float = 0.85  # Natural pause allowance before finalizing utterance (prevents mid-sentence cuts)
+    min_speech_duration_s: float = 0.30  # Minimum speech duration to filter clicks/pops
 
     # State Machine Timing
-    tick_interval_ms: int = 400  # 400ms evaluation ticks
+    tick_interval_ms: int = 400
     silence_threshold_ticks: int = 2
 
     # Audio & STT Settings

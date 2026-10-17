@@ -23,16 +23,16 @@ class FLMDecision:
 class FLMClient:
     """Client for FastFlowLM (FLM) running locally on NPU with streaming response."""
 
-    PROMPT_TEMPLATE = """You are Vartalap, an intelligent real-time conversational voice assistant.
+    PROMPT_TEMPLATE = """You are Vartalap, a fast real-time conversational voice assistant.
 
 Rules:
-1. SAFETY FIRST: If the user is about to do something DANGEROUS (mixing chemicals, touching live wires, self-harm, etc), IMMEDIATELY output <talk> followed by an urgent warning in 10-25 words explaining WHY it is dangerous.
-   Example: <talk>Stop immediately! Sodium reacts violently with water causing an explosion, intense heat, and severe burns.
-2. If the user tells you to stop, wait, or be quiet, acknowledge politely in 5-10 words:
-   Example: <talk>I have stopped. What would you like to know?
-3. If the user spoke to you or asked a question, output <talk> followed by a natural, direct, conversational answer in 10-25 words. Speak in complete sentences.
-4. If you have already fully answered the user and they have not said anything new, output: <done>
-5. Do NOT repeat what you already said. Build on the conversation naturally.
+1. SAFETY FIRST: If user proposes something dangerous (live wires, chemicals in water, self-harm), output <talk> with an urgent warning in 10-20 words explaining WHY it is dangerous.
+   Example: <talk>Stop immediately! Sodium reacts violently with water, causing an explosion, intense heat, and severe burns.
+2. If user utterance is incomplete, trailing off, or mid-thought (e.g. "so like", "what is the...", "can you"), output ONLY: <listen>
+   Do NOT say "please finish your question". Simply output <listen>.
+3. If user says stop, wait, or be quiet, output: <talk>I have stopped. What would you like to know?
+4. If user asked a complete question, output <talk> followed by a concise, natural, direct answer in 10-20 words in complete sentences.
+5. If you already answered and user is silent, output: <done>
 
 Conversation History:
 {history}
@@ -40,7 +40,6 @@ Conversation History:
 [Current State]
 User Said: "{current_partial_transcript}"
 User Silence Ticks: {silence_tick_count}
-Your Previous Response: "{agent_last_chunk}"
 
 Output decision:
 """
@@ -57,11 +56,19 @@ Output decision:
         silence_tick_count: int,
         agent_last_chunk: str,
     ) -> str:
+        # Keep only the last 6 lines of history for fast prefill
+        clean_history = history.strip()
+        if clean_history:
+            lines = clean_history.split("\n")
+            if len(lines) > 6:
+                clean_history = "\n".join(lines[-6:])
+        else:
+            clean_history = "None"
+
         return self.PROMPT_TEMPLATE.format(
-            history=history.strip() or "None",
+            history=clean_history,
             current_partial_transcript=current_partial_transcript.strip(),
             silence_tick_count=silence_tick_count,
-            agent_last_chunk=agent_last_chunk.strip(),
         )
 
     def evaluate(
@@ -117,7 +124,6 @@ Output decision:
                                 first_token_time = time.perf_counter()
                             collected_tokens.append(delta)
 
-                            # Early exit on single control tokens
                             partial = "".join(collected_tokens).strip()
                             if "<listen>" in partial or "<done>" in partial:
                                 break
@@ -141,7 +147,6 @@ Output decision:
         full_text = "".join(collected_tokens).strip()
         ttft = (first_token_time - t_start) * 1000 if first_token_time else 0.0
 
-        # Decision extraction
         if "<listen>" in full_text:
             return FLMDecision(
                 action="listen",
@@ -172,7 +177,6 @@ Output decision:
                 raw_response=full_text,
             )
         else:
-            # If model answered directly without <talk> tag
             clean_text = full_text.strip()
             if clean_text:
                 return FLMDecision(
