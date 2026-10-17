@@ -130,6 +130,13 @@ class VartalapStateMachine:
             self._finalize_turn()
             self.set_state(VartalapState.IDLE)
 
+        else:
+            # Handle error or transient failures by sleeping the tick interval (never spin-loop!)
+            elapsed = time.perf_counter() - t_tick_start
+            sleep_time = max(0.2, (self.config.tick_interval_ms / 1000.0) - elapsed)
+            time.sleep(sleep_time)
+
+
     def _handle_talking(self):
         """STATE: TALKING - Wait for 3-4 words burst playback to finish."""
         # Wait until current burst completes playback or interrupted

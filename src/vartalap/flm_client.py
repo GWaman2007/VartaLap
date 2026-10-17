@@ -86,13 +86,18 @@ Output decision:
             "stream": True,
         }
 
+        headers = {
+            "Connection": "close",
+            "Content-Type": "application/json",
+        }
+
         try:
-            with self._http_client.stream("POST", self.endpoint, json=payload) as response:
+            with self._http_client.stream("POST", self.endpoint, json=payload, headers=headers) as response:
                 if response.status_code != 200:
                     t_end = time.perf_counter()
                     return FLMDecision(
                         action="error",
-                        raw_response=f"HTTP {response.status_code}",
+                        raw_response=f"HTTP {response.status_code} - {response.text}",
                         latency_ms=(t_end - t_start) * 1000,
                     )
 
@@ -161,11 +166,18 @@ Output decision:
 
         except Exception as e:
             t_end = time.perf_counter()
+            # Reset client after socket errors
+            try:
+                self._http_client.close()
+            except Exception:
+                pass
+            self._http_client = httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0))
             return FLMDecision(
                 action="error",
-                raw_response=str(e),
+                raw_response=f"{type(e).__name__}: {str(e)}",
                 latency_ms=(t_end - t_start) * 1000,
             )
+
 
         t_end = time.perf_counter()
         full_text = "".join(collected_tokens).strip()

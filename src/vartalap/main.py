@@ -93,12 +93,19 @@ def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = N
         console.print(f"[bold yellow]🔄 [STATE CHANGE][/] {old_s.value} -> [bold green]{new_s.value}[/]")
 
     def on_dec(dec: FLMDecision, state: VartalapState):
-        color = "cyan" if dec.action == "listen" else ("magenta" if dec.action == "talk" else "yellow")
-        console.print(
-            f"[{color}][DECISION - {state.value}][/] <{dec.action}> "
-            f"| Latency: [bold]{dec.latency_ms:.1f}ms[/] (TTFT: {dec.ttft_ms:.1f}ms) "
-            f"| Utterance: \"{dec.utterance}\""
-        )
+        if dec.action == "error":
+            console.print(
+                f"[bold red][FLM ERROR - {state.value}][/] Latency: {dec.latency_ms:.1f}ms "
+                f"| Detail: {dec.raw_response}"
+            )
+        else:
+            color = "cyan" if dec.action == "listen" else ("magenta" if dec.action == "talk" else "yellow")
+            console.print(
+                f"[{color}][DECISION - {state.value}][/] <{dec.action}> "
+                f"| Latency: [bold]{dec.latency_ms:.1f}ms[/] (TTFT: {dec.ttft_ms:.1f}ms) "
+                f"| Utterance: \"{dec.utterance}\""
+            )
+
 
     def on_burst(text: str):
         console.print(f"[bold magenta]🔊 [PIPER TTS PLAYING][/] \"{text}\"")
