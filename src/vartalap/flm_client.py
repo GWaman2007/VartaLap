@@ -21,22 +21,25 @@ class FLMDecision:
 
 
 class FLMClient:
-    """Client for FastFlowLM (FLM) running locally on NPU with single-token escape."""
+    """Client for FastFlowLM (FLM) running locally on NPU with streaming response."""
 
-    PROMPT_TEMPLATE = """You are Vartalap, an ultra-low latency real-time conversational monitor and interruption engine.
+    PROMPT_TEMPLATE = """You are Vartalap, an intelligent real-time conversational voice assistant.
+
 Rules:
-1. If the user proposes a dangerous, harmful, or incorrect action (e.g. adding sodium to water, touching live wires) or asks an urgent question, IMMEDIATELY INTERRUPT mid-speech with: <talk> followed by at most 4 words (e.g. <talk>Stop! Dangerous explosion! or <talk>No, do not!).
-2. If the user is speaking normally mid-thought, output: <listen>
-3. If the user has finished speaking and paused (silence >= 2 turns), output: <talk> followed by at most 4 words.
-4. If you have completely finished speaking and the user has been silent, output: <done>
+1. SAFETY FIRST: If the user is about to do something DANGEROUS (mixing chemicals, touching live wires, self-harm, etc), IMMEDIATELY output <talk> followed by a clear warning of 10-20 words explaining WHY it is dangerous.
+   Example: <talk>Stop immediately! Sodium reacts violently with water causing an explosion and severe burns.
+2. If the user is mid-sentence and still speaking, output ONLY: <listen>
+3. If the user has finished speaking (silence >= 2 ticks) and asked a question or said something that warrants a response, output <talk> followed by a natural, helpful response of 10-25 words. Speak in complete sentences.
+4. If you have already fully answered and the user is silent, output: <done>
+5. Do NOT repeat what you already said. Build on the conversation naturally.
 
 Conversation History:
 {history}
 
 [Current State]
-User Audio: "{current_partial_transcript}"
+User Said: "{current_partial_transcript}"
 User Silence Ticks: {silence_tick_count}
-Your Last Partial Utterance: "{agent_last_chunk}"
+Your Previous Response: "{agent_last_chunk}"
 
 Output decision:
 """
@@ -45,7 +48,7 @@ Output decision:
     def __init__(self, config: Optional[VartalapConfig] = None):
         self.config = config or VartalapConfig()
         self.endpoint = f"{self.config.flm_base_url}/chat/completions"
-        self._http_client = httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0))
+        self._http_client = httpx.Client(timeout=httpx.Timeout(8.0, connect=3.0))
 
     def format_prompt(
         self,
@@ -83,7 +86,7 @@ Output decision:
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 12,
+            "max_tokens": self.config.max_tokens,
             "temperature": 0.0,
             "stream": True,
         }
@@ -113,6 +116,11 @@ Output decision:
                             if first_token_time is None:
                                 first_token_time = time.perf_counter()
                             collected_tokens.append(delta)
+
+                            # Early exit: if we see <listen> or <done>, no need to wait
+                            partial = "".join(collected_tokens).strip()
+                            if "<listen>" in partial or "<done>" in partial:
+                                break
                     except Exception:
                         pass
 
@@ -133,7 +141,7 @@ Output decision:
         full_text = "".join(collected_tokens).strip()
         ttft = (first_token_time - t_start) * 1000 if first_token_time else 0.0
 
-        # Parse decision from complete burst
+        # Parse decision from complete response
         if "<listen>" in full_text:
             return FLMDecision(
                 action="listen",
@@ -152,11 +160,14 @@ Output decision:
             )
         elif "<talk>" in full_text:
             match = re.search(r"<talk>(.*?)(?:</talk>|\n|$)", full_text, re.DOTALL)
-            raw_words = match.group(1).strip().split() if match else []
-            burst_words = " ".join(raw_words[:4]) if raw_words else full_text.replace("<talk>", "").strip()
+            utterance = match.group(1).strip() if match else full_text.replace("<talk>", "").strip()
+            # Clean up any residual tags
+            utterance = utterance.replace("<done>", "").replace("<listen>", "").strip()
+            if not utterance:
+                utterance = full_text.replace("<talk>", "").replace("<done>", "").replace("<listen>", "").strip()
             return FLMDecision(
                 action="talk",
-                utterance=burst_words,
+                utterance=utterance,
                 latency_ms=(t_end - t_start) * 1000,
                 ttft_ms=ttft,
                 raw_response=full_text,

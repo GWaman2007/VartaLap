@@ -6,7 +6,6 @@ from typing import Callable, Optional
 
 from .config import VartalapConfig
 from .flm_client import FLMClient, FLMDecision
-from .stt_stream import SherpaSTTStream
 from .tts_player import PiperTTSPlayer
 
 
@@ -18,18 +17,33 @@ class VartalapState(str, enum.Enum):
 
 
 class VartalapStateMachine:
-    """Core 4-state conversational monitor and turn-taking harness."""
+    """Core 4-state conversational monitor and turn-taking harness.
+    
+    Supports both Whisper (FLM NPU) and Sherpa-ONNX STT backends.
+    Features instant barge-in (TTS cancellation on user speech) and
+    multi-burst continuation for natural flowing responses.
+    """
 
     def __init__(
         self,
         config: Optional[VartalapConfig] = None,
         flm: Optional[FLMClient] = None,
-        stt: Optional[SherpaSTTStream] = None,
+        stt=None,  # WhisperSTTStream or SherpaSTTStream
         tts: Optional[PiperTTSPlayer] = None,
     ):
         self.config = config or VartalapConfig()
         self.flm = flm or FLMClient(self.config)
-        self.stt = stt or SherpaSTTStream(self.config)
+
+        # Lazy-load STT based on config
+        if stt is not None:
+            self.stt = stt
+        elif self.config.stt_backend == "whisper":
+            from .whisper_stt import WhisperSTTStream
+            self.stt = WhisperSTTStream(self.config)
+        else:
+            from .stt_stream import SherpaSTTStream
+            self.stt = SherpaSTTStream(self.config)
+
         self.tts = tts or PiperTTSPlayer(self.config)
 
         self.current_state = VartalapState.IDLE
@@ -40,11 +54,13 @@ class VartalapStateMachine:
         self._running = False
         self._loop_thread: Optional[threading.Thread] = None
         self._playback_finished_event = threading.Event()
+        self._barge_in_detected = threading.Event()  # Instant barge-in flag
 
         # Hooks for telemetry and UI
         self.on_state_change: Optional[Callable[[VartalapState, VartalapState], None]] = None
         self.on_decision: Optional[Callable[[FLMDecision, VartalapState], None]] = None
         self.on_tts_burst: Optional[Callable[[str], None]] = None
+        self.on_barge_in: Optional[Callable[[], None]] = None
 
     def set_state(self, new_state: VartalapState):
         if self.current_state != new_state:
@@ -95,7 +111,7 @@ class VartalapStateMachine:
             pass
 
     def _handle_monitoring(self):
-        """STATE: MONITORING - Evaluates every 500ms tick."""
+        """STATE: MONITORING - Evaluates every tick to decide listen/talk/done."""
         t_tick_start = time.perf_counter()
 
         # Check silence tick status
@@ -120,7 +136,7 @@ class VartalapStateMachine:
             time.sleep(sleep_time)
 
         elif decision.action == "talk":
-            # Stream 3-4 words to Piper and transition to TALKING
+            # Speak the full response via Piper TTS
             self.agent_last_chunk = decision.utterance
             self.agent_turn_accumulator.append(decision.utterance)
             self._start_speech_burst(decision.utterance)
@@ -131,23 +147,43 @@ class VartalapStateMachine:
             self.set_state(VartalapState.IDLE)
 
         else:
-            # Handle error or transient failures by sleeping the tick interval (never spin-loop!)
+            # Handle error or transient failures
             elapsed = time.perf_counter() - t_tick_start
             sleep_time = max(0.2, (self.config.tick_interval_ms / 1000.0) - elapsed)
             time.sleep(sleep_time)
 
 
     def _handle_talking(self):
-        """STATE: TALKING - Wait for 3-4 words burst playback to finish."""
-        # Wait until current burst completes playback or interrupted
-        self._playback_finished_event.wait(timeout=3.0)
+        """STATE: TALKING - Wait for TTS burst playback. Monitor for barge-in."""
+        self._barge_in_detected.clear()
+
+        # Poll for either playback completion or barge-in
+        while not self._playback_finished_event.is_set():
+            # Check for barge-in: user started speaking during TTS
+            if not self.stt.transcript_queue.empty():
+                # BARGE-IN! Instantly cancel TTS and go to MONITORING
+                self.tts.stop()
+                self.stt.mute_mic = False
+                self._playback_finished_event.set()
+                self._barge_in_detected.set()
+
+                if self.on_barge_in:
+                    self.on_barge_in()
+
+                # Finalize what we already said, then go monitor user's new speech
+                self._finalize_turn()
+                self.set_state(VartalapState.MONITORING)
+                return
+
+            time.sleep(0.02)  # 20ms poll interval - responsive but not wasteful
+
         self._playback_finished_event.clear()
 
-        # Burst playback is complete -> transition to ARBITRATION
+        # Normal completion -> ARBITRATION (check if we should continue talking)
         self.set_state(VartalapState.ARBITRATION)
 
     def _handle_arbitration(self):
-        """STATE: ARBITRATION - Check STT buffer & silence ticks."""
+        """STATE: ARBITRATION - Decide whether to continue speaking or yield turn."""
         t_tick_start = time.perf_counter()
 
         silence_ticks = self.stt.check_silence_tick()
@@ -156,17 +192,13 @@ class VartalapStateMachine:
         # Check if user spoke any NEW words during playback
         user_spoke_during_playback = not self.stt.transcript_queue.empty()
 
-        # If user did NOT speak during playback and model already delivered its answer:
-        if not user_spoke_during_playback and self.agent_turn_accumulator:
-            # Model finished answering and user is silent -> yield turn & sleep
-            decision = FLMDecision(action="done", utterance="", raw_response="<done> (turn-yield)")
-            if self.on_decision:
-                self.on_decision(decision, VartalapState.ARBITRATION)
+        # If user spoke, immediately go to MONITORING for their turn
+        if user_spoke_during_playback:
             self._finalize_turn()
-            self.set_state(VartalapState.IDLE)
+            self.set_state(VartalapState.MONITORING)
             return
 
-        # Otherwise, user spoke or interrupted -> evaluate Gemma
+        # If user is silent, check if model wants to continue
         decision = self.flm.evaluate(
             history=self.history,
             current_partial_transcript=current_partial,
@@ -182,7 +214,7 @@ class VartalapStateMachine:
             last_text = self.agent_last_chunk.strip().lower()
             already_spoken = [x.strip().lower() for x in self.agent_turn_accumulator]
 
-            # Repetition guard: If model repeats the same words, it is done
+            # Repetition guard
             if new_text == last_text or new_text in already_spoken:
                 decision = FLMDecision(action="done", utterance="", raw_response="<done> (repetition-halt)")
                 if self.on_decision:
@@ -191,7 +223,6 @@ class VartalapStateMachine:
                 self.set_state(VartalapState.IDLE)
                 return
 
-
             # Continue speaking next chunk
             self.agent_last_chunk = decision.utterance
             self.agent_turn_accumulator.append(decision.utterance)
@@ -199,21 +230,19 @@ class VartalapStateMachine:
             self.set_state(VartalapState.TALKING)
 
         elif decision.action == "listen":
-            # User spoke or interrupted, model backs off
+            # User may be about to speak, go back to monitoring
             self.set_state(VartalapState.MONITORING)
 
         elif decision.action == "done":
-            # Turn is completely done, sleep to IDLE
             self._finalize_turn()
             self.set_state(VartalapState.IDLE)
         else:
-            # On error or transient state, wait before retrying
             elapsed = time.perf_counter() - t_tick_start
             sleep_time = max(0.2, (self.config.tick_interval_ms / 1000.0) - elapsed)
             time.sleep(sleep_time)
 
     def _start_speech_burst(self, text: str):
-        """Initiates Piper TTS playback for 3-4 words with mic echo muting."""
+        """Initiates Piper TTS playback with mic echo muting."""
         self._playback_finished_event.clear()
         self.stt.mute_mic = True
         if self.on_tts_burst:
@@ -239,6 +268,11 @@ class VartalapStateMachine:
             if agent_utterance:
                 turn_text += f"Agent: {agent_utterance}\n"
             self.history = (self.history + "\n" + turn_text).strip()
+
+            # Keep history manageable (last ~10 turns)
+            lines = self.history.split("\n")
+            if len(lines) > 20:
+                self.history = "\n".join(lines[-20:])
 
         self.agent_last_chunk = ""
         self.agent_turn_accumulator.clear()

@@ -7,8 +7,11 @@ class VartalapConfig:
     # FastFlowLM Settings
     flm_base_url: str = "http://127.0.0.1:52625/v1"
     model_name: str = "gemma4-it:e2b"
-    max_tokens: int = 16
+    max_tokens: int = 40  # Allow 15-25 word natural responses
     temperature: float = 0.1
+
+    # STT Backend: "whisper" (FLM NPU) or "sherpa" (legacy)
+    stt_backend: str = "whisper"
 
     # State Machine Timing
     tick_interval_ms: int = 500  # 500ms evaluation ticks

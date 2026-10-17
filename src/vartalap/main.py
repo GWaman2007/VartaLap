@@ -14,8 +14,6 @@ except ImportError:
 from .config import VartalapConfig
 from .flm_client import FLMClient, FLMDecision
 from .state_machine import VartalapState, VartalapStateMachine
-from .stt_stream import SherpaSTTStream
-from .tts_player import PiperTTSPlayer
 
 console = Console()
 
@@ -54,9 +52,19 @@ def list_audio_devices():
 
 
 def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = None):
-    console.print(Panel("[bold green]Starting Vartalap Conversational Monitor[/bold green]\n"
-                        "[dim]Ultra-low latency real-time voice harness (Sherpa-ONNX + FastFlowLM + Piper)[/dim]",
-                        border_style="green"))
+    stt_label = "Whisper-V3 Turbo (NPU)" if config.stt_backend == "whisper" else "Sherpa-ONNX Zipformer"
+    console.print(Panel(
+        f"[bold green]Starting Vartalap Conversational Agent[/bold green]\n"
+        f"[dim]Real-time duplex voice harness[/dim]\n"
+        f"[cyan]STT:[/] {stt_label}  •  [cyan]LLM:[/] {config.model_name}  •  [cyan]TTS:[/] Piper Neural",
+        border_style="green"
+    ))
+
+    if config.stt_backend == "whisper":
+        console.print(
+            "[bold yellow]⚠  Make sure FLM is running with --asr 1:[/]\n"
+            f"   [dim]flm serve {config.model_name} --asr 1[/dim]\n"
+        )
 
     # Audio Device Diagnostics
     if sd is not None:
@@ -106,17 +114,20 @@ def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = N
                 f"| Utterance: \"{dec.utterance}\""
             )
 
-
     def on_burst(text: str):
-        console.print(f"[bold magenta]🔊 [PIPER TTS PLAYING][/] \"{text}\"")
+        console.print(f"[bold magenta]🔊 [TTS PLAYING][/] \"{text}\"")
+
+    def on_barge_in():
+        console.print(f"[bold red]⚡ [BARGE-IN] User interrupted! TTS cancelled.[/]")
 
     harness.stt.on_energy = on_energy
     harness.stt.on_partial_transcript = on_partial
     harness.on_state_change = on_state
     harness.on_decision = on_dec
     harness.on_tts_burst = on_burst
+    harness.on_barge_in = on_barge_in
 
-    console.print("[bold green]Initializing STT audio stream...[/bold green]")
+    console.print("[bold green]Initializing audio streams...[/bold green]")
     try:
         harness.start(mic_device=mic_device)
         console.print("[bold yellow]✅ Vartalap is LIVE! Speak into your microphone now (Press Ctrl+C to stop)...[/bold yellow]\n")
@@ -135,72 +146,16 @@ def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = N
         console.print("[bold green]Stopped cleanly.[/bold green]")
 
 
-def run_simulation(config: VartalapConfig):
-    console.print("[bold cyan]=== Running End-to-End State Machine Simulation ===[/bold cyan]")
-    stt = SherpaSTTStream(config)
-    tts = PiperTTSPlayer(config)
-    flm = FLMClient(config)
-
-    harness = VartalapStateMachine(config=config, flm=flm, stt=stt, tts=tts)
-
-    def on_state(old_s, new_s):
-        console.print(f"[bold yellow][STATE CHANGE][/] {old_s.value} -> [bold green]{new_s.value}[/]")
-
-    def on_dec(dec, state):
-        console.print(
-            f"[dim][{state.value}][/dim] FLM Decision: [bold]{dec.action}[/] "
-            f"| Latency: {dec.latency_ms:.1f}ms | Utterance: \"{dec.utterance}\""
-        )
-
-    def on_burst(text):
-        console.print(f"[bold magenta][TTS BURST PLAYBACK][/] \"{text}\"")
-
-    harness.on_state_change = on_state
-    harness.on_decision = on_dec
-    harness.on_tts_burst = on_burst
-
-    # Start harness worker loop
-    harness._running = True
-    loop_thread = threading.Thread(target=harness._run_loop, daemon=True)
-    loop_thread.start()
-
-    console.print(f"\n[1] Current state: [bold]{harness.current_state.value}[/]. (Waiting for user speech - 0 inference load)")
-    time.sleep(1.0)
-
-    console.print("\n[2] User starts speaking: 'What' -> feeding to transcript queue...")
-    stt.transcript_queue.put("What")
-    time.sleep(0.5)
-
-    console.print(f"Harness woke up! Current state: [bold]{harness.current_state.value}[/]")
-    time.sleep(0.5)
-
-    console.print("\n[3] User continues speaking mid-thought: 'is two plus two'...")
-    stt._current_partial = "What is two plus two"
-    stt._words_arrived_in_window = True
-    time.sleep(1.0)
-
-    console.print("\n[4] User stops speaking. Ticking silence x 2 turns...")
-    stt._words_arrived_in_window = False
-    time.sleep(1.5)
-
-    console.print("\n[5] Waiting for Piper TTS burst and arbitration...")
-    time.sleep(3.0)
-
-    console.print(f"\n[6] Cycle finished! State is now: [bold]{harness.current_state.value}[/]")
-    console.print(f"Conversation History:\n{harness.history}")
-
-    harness.stop()
-    console.print("[bold green][OK] Simulation complete![/bold green]")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Vartalap Conversational Monitor")
+    parser = argparse.ArgumentParser(description="Vartalap Conversational Agent")
     parser.add_argument("--simulate", action="store_true", help="Run simulated end-to-end conversation flow")
     parser.add_argument("--list-devices", action="store_true", help="List all available audio input and output devices")
     parser.add_argument("--mic", type=int, default=None, help="Audio input device index")
     parser.add_argument("--out", type=int, default=None, help="Audio output device index")
     parser.add_argument("--model", type=str, default="gemma4-it:e2b", help="FastFlowLM model tag")
     parser.add_argument("--flm-url", type=str, default="http://127.0.0.1:52625/v1", help="FLM API base URL")
+    parser.add_argument("--stt", type=str, default="whisper", choices=["whisper", "sherpa"],
+                        help="STT backend: 'whisper' (FLM NPU, recommended) or 'sherpa' (Sherpa-ONNX)")
 
     args = parser.parse_args()
 
@@ -211,10 +166,11 @@ def main():
     config = VartalapConfig(
         model_name=args.model,
         flm_base_url=args.flm_url,
+        stt_backend=args.stt,
     )
 
     if args.simulate:
-        run_simulation(config)
+        console.print("[yellow]Simulation mode not available with Whisper STT. Use --stt sherpa for simulation.[/yellow]")
     else:
         run_live(config, mic_device=args.mic, out_device=args.out)
 
