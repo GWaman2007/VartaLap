@@ -12,6 +12,7 @@ class VartalapConfig:
 
     # STT Backend: "sherpa" (CPU streaming, default) or "whisper" (FLM NPU)
     stt_backend: str = "sherpa"
+    echo_suppression: bool = True
 
     # State Machine Timing
     tick_interval_ms: int = 500  # 500ms evaluation ticks

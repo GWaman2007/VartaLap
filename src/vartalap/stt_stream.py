@@ -78,8 +78,8 @@ class SherpaSTTStream:
                 if not self._running:
                     return
 
-                # If echo suppression enabled and mic is muted, drop frames
-                if self.config.echo_suppression and self.mute_mic:
+                # Echo suppression: drop frames if mic is explicitly muted during TTS
+                if getattr(self.config, "echo_suppression", True) and self.mute_mic:
                     return
 
                 samples = indata[:, 0].copy()
