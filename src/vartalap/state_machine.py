@@ -38,8 +38,8 @@ class VartalapStateMachine:
         if stt is not None:
             self.stt = stt
         elif self.config.stt_backend == "whisper":
-            from .whisper_stt import WhisperSTTStream
-            self.stt = WhisperSTTStream(self.config)
+            from .faster_whisper_stt import FasterWhisperSTTStream
+            self.stt = FasterWhisperSTTStream(self.config)
         else:
             from .stt_stream import SherpaSTTStream
             self.stt = SherpaSTTStream(self.config)

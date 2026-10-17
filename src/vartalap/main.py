@@ -52,7 +52,7 @@ def list_audio_devices():
 
 
 def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = None):
-    stt_label = "Sherpa-ONNX Zipformer (CPU Streaming)" if config.stt_backend == "sherpa" else "Whisper-V3 Turbo (NPU)"
+    stt_label = "Faster-Whisper (220ms, INT8 CPU)" if config.stt_backend == "whisper" else "Sherpa-ONNX Zipformer (CPU Streaming)"
     console.print(Panel(
         f"[bold green]Starting Vartalap Conversational Monitor[/bold green]\n"
         f"[dim]Continuous real-time voice harness[/dim]\n"
@@ -143,8 +143,8 @@ def main():
     parser.add_argument("--out", type=int, default=None, help="Audio output device index")
     parser.add_argument("--model", type=str, default="gemma4-it:e2b", help="FastFlowLM model tag")
     parser.add_argument("--flm-url", type=str, default="http://127.0.0.1:52625/v1", help="FLM API base URL")
-    parser.add_argument("--stt", type=str, default="sherpa", choices=["sherpa", "whisper"],
-                        help="STT backend: 'sherpa' (CPU streaming, default) or 'whisper' (FLM NPU)")
+    parser.add_argument("--stt", type=str, default="whisper", choices=["whisper", "sherpa"],
+                        help="STT backend: 'whisper' (Faster-Whisper, 220ms, default) or 'sherpa' (Zipformer)")
 
     args = parser.parse_args()
 

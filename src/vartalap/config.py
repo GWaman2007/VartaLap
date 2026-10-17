@@ -10,12 +10,13 @@ class VartalapConfig:
     max_tokens: int = 35  # Natural 12-25 word conversational answers
     temperature: float = 0.0  # Deterministic, lowest latency
 
-    # STT Backend: "sherpa" (CPU streaming, default) or "whisper" (FLM NPU)
-    stt_backend: str = "sherpa"
+    # STT Backend: "whisper" (faster-whisper, 220ms, recommended) or "sherpa" (Zipformer)
+    stt_backend: str = "whisper"
+    whisper_model_size: str = "tiny.en"
     echo_suppression: bool = True
 
     # State Machine Timing
-    tick_interval_ms: int = 500  # 500ms evaluation ticks
+    tick_interval_ms: int = 400  # 400ms evaluation ticks
     silence_threshold_ticks: int = 2
 
     # Audio & STT Settings

@@ -15,7 +15,8 @@ dependencies = [
     "requests>=2.31.0",
     "httpx>=0.25.0",
     "pydantic>=2.0.0",
-    "rich>=13.0.0"
+    "rich>=13.0.0",
+    "faster-whisper>=1.2.1",
 ]
 
 [project.scripts]
