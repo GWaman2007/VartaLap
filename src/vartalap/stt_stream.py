@@ -33,7 +33,12 @@ class SherpaSTTStream:
         self._last_emitted_text = ""
         self._words_arrived_in_window = False
         self.silence_tick_count = 0
+        self.last_audio_rms = 0.0
         self._lock = threading.Lock()
+
+        # Callbacks
+        self.on_partial_transcript: Optional[Callable[[str], None]] = None
+        self.on_energy: Optional[Callable[[float], None]] = None
 
         self._worker_thread: Optional[threading.Thread] = None
 
@@ -67,7 +72,12 @@ class SherpaSTTStream:
                 if status:
                     pass
                 if self._running:
-                    self._audio_queue.put(indata[:, 0].copy())
+                    samples = indata[:, 0].copy()
+                    rms = float(np.sqrt(np.mean(samples**2)))
+                    self.last_audio_rms = rms
+                    if self.on_energy:
+                        self.on_energy(rms)
+                    self._audio_queue.put(samples)
 
             self._input_stream = sd.InputStream(
                 samplerate=self.config.sample_rate,
@@ -86,8 +96,11 @@ class SherpaSTTStream:
     def stop(self):
         self._running = False
         if self._input_stream:
-            self._input_stream.stop()
-            self._input_stream.close()
+            try:
+                self._input_stream.stop()
+                self._input_stream.close()
+            except Exception:
+                pass
             self._input_stream = None
 
     def _decoding_worker(self):
@@ -106,21 +119,36 @@ class SherpaSTTStream:
                 self._recognizer.decode_stream(self._stream)
 
             result = self._recognizer.get_result(self._stream)
-            text = result.text.strip() if hasattr(result, "text") else ""
+            if isinstance(result, str):
+                text = result.strip()
+            elif hasattr(result, "text"):
+                text = result.text.strip()
+            else:
+                text = str(result).strip()
 
             if text and text != self._last_emitted_text:
-                new_part = text[len(self._last_emitted_text):].strip()
-                if new_part:
-                    with self._lock:
-                        self._current_partial = text
-                        self._words_arrived_in_window = True
-                        for word in new_part.split():
+                with self._lock:
+                    self._current_partial = text
+                    self._words_arrived_in_window = True
+                    # Find newly recognized words
+                    old_words = self._last_emitted_text.split()
+                    new_words = text.split()
+                    if len(new_words) > len(old_words):
+                        for word in new_words[len(old_words):]:
                             self.transcript_queue.put(word)
+                    elif not old_words:
+                        for word in new_words:
+                            self.transcript_queue.put(word)
+
                 self._last_emitted_text = text
+
+                if self.on_partial_transcript:
+                    self.on_partial_transcript(text)
 
             if self._recognizer.is_endpoint(self._stream):
                 self._recognizer.reset(self._stream)
                 self._last_emitted_text = ""
+
 
     def check_silence_tick(self) -> int:
         """Called every 500ms tick. Increments silence count if no new words arrived."""

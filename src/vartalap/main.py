@@ -1,10 +1,15 @@
 import argparse
 import sys
+import threading
 import time
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 
 from .config import VartalapConfig
 from .flm_client import FLMClient, FLMDecision
@@ -15,90 +20,112 @@ from .tts_player import PiperTTSPlayer
 console = Console()
 
 
-def build_status_display(
-    state: VartalapState,
-    partial_transcript: str,
-    silence_ticks: int,
-    last_decision: FLMDecision,
-    last_burst: str,
-    history: str,
-) -> Panel:
-    table = Table.grid(padding=(0, 2))
-    table.add_column(style="bold cyan", justify="right")
-    table.add_column(style="white")
+def list_audio_devices():
+    """Lists all available input and output devices."""
+    if sd is None:
+        console.print("[red]sounddevice library not installed or audio unavailable[/red]")
+        return
 
-    # State Badge Styling
-    state_styles = {
-        VartalapState.IDLE: "[bold green on black] [IDLE] (Zero Inference) [/]",
-        VartalapState.MONITORING: "[bold yellow on black] [MONITORING] (500ms Ticks) [/]",
-        VartalapState.TALKING: "[bold magenta on black] [TALKING] (Piper Burst) [/]",
-        VartalapState.ARBITRATION: "[bold blue on black] [ARBITRATION] (Yield Check) [/]",
-    }
-    state_badge = state_styles.get(state, str(state))
+    devices = sd.query_devices()
+    default_in, default_out = sd.default.device
 
-    table.add_row("System State:", state_badge)
-    table.add_row("User Partial Audio:", f'"{partial_transcript}"' if partial_transcript else "[dim]<silent>[/dim]")
-    table.add_row("Silence Ticks:", f"{silence_ticks} (500ms units)")
+    table = Table(title="Available Audio Devices", show_lines=True)
+    table.add_column("Index", justify="right", style="cyan")
+    table.add_column("Device Name", style="white")
+    table.add_column("Max In/Out", justify="center")
+    table.add_column("Default", justify="center", style="bold green")
 
-    action_color = {
-        "listen": "[cyan]<listen>[/cyan]",
-        "talk": f"[green]<talk>[/green] -> \"{last_decision.utterance}\"",
-        "done": "[yellow]<done>[/yellow]",
-        "error": f"[red]<error: {last_decision.raw_response}>[/red]",
-    }.get(last_decision.action, last_decision.action)
+    for idx, d in enumerate(devices):
+        is_def = []
+        if idx == default_in:
+            is_def.append("DEFAULT IN")
+        if idx == default_out:
+            is_def.append("DEFAULT OUT")
+        def_label = ", ".join(is_def) if is_def else ""
 
-    table.add_row("Last Decision:", action_color)
-    table.add_row("FLM Latency:", f"{last_decision.latency_ms:.1f} ms (TTFT: {last_decision.ttft_ms:.1f} ms)")
-    table.add_row("Agent Last Burst:", f'"{last_burst}"' if last_burst else "[dim]None[/dim]")
-
-    if history:
-        history_preview = "\n".join(history.strip().splitlines()[-4:])
-        table.add_row("Recent History:", f"[dim]{history_preview}[/dim]")
-
-    return Panel(
-        table,
-        title="[bold white]Vartalap Conversational Monitor[/bold white]",
-        border_style="bright_blue",
-    )
-
-
-def run_live(config: VartalapConfig, mic_device: int = None):
-    console.print("[bold green]Starting Vartalap in Real-Time Microphone Mode...[/bold green]")
-    harness = VartalapStateMachine(config=config)
-
-    last_decision = FLMDecision(action="listen")
-    last_burst = ""
-
-    def on_state(old_s, new_s):
-        console.log(f"[bold dim]State Transition:[/] {old_s.value} -> [bold underline]{new_s.value}[/]")
-
-    def on_dec(dec, state):
-        nonlocal last_decision
-        last_decision = dec
-        console.log(
-            f"[dim][{state.value}][/dim] Decision: [bold]{dec.action}[/] "
-            f"| Latency: {dec.latency_ms:.1f}ms | Raw: {dec.raw_response}"
+        table.add_row(
+            str(idx),
+            d["name"],
+            f"{d['max_input_channels']} in / {d['max_output_channels']} out",
+            def_label,
         )
 
-    def on_burst(text):
-        nonlocal last_burst
-        last_burst = text
-        console.log(f"[bold magenta]Agent Output Burst:[/] \"{text}\"")
+    console.print(table)
 
+
+def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = None):
+    console.print(Panel("[bold green]Starting Vartalap Conversational Monitor[/bold green]\n"
+                        "[dim]Ultra-low latency real-time voice harness (Sherpa-ONNX + FastFlowLM + Piper)[/dim]",
+                        border_style="green"))
+
+    # Audio Device Diagnostics
+    if sd is not None:
+        default_in, default_out = sd.default.device
+        chosen_in = mic_device if mic_device is not None else default_in
+        chosen_out = out_device if out_device is not None else default_out
+        try:
+            in_info = sd.query_devices(chosen_in)
+            out_info = sd.query_devices(chosen_out)
+            console.print(f"[bold cyan]Input Mic:[/]  [{chosen_in}] {in_info['name']}")
+            console.print(f"[bold cyan]Output TTS:[/] [{chosen_out}] {out_info['name']}")
+        except Exception as e:
+            console.print(f"[yellow]Audio device query warning:[/] {e}")
+
+    harness = VartalapStateMachine(config=config)
+
+    # Verbose Diagnostic Callbacks
+    last_rms_log_time = 0.0
+
+    def on_energy(rms: float):
+        nonlocal last_rms_log_time
+        now = time.perf_counter()
+        # Log voice activity if RMS is noticeable (> 0.01) every 0.8s
+        if rms > 0.015 and (now - last_rms_log_time) > 0.8:
+            bars = min(20, int(rms * 150))
+            meter = "|" * bars
+            console.print(f"[dim green][MIC ACTIVITY][/] {meter:<20} (RMS: {rms:.4f})")
+            last_rms_log_time = now
+
+    def on_partial(text: str):
+        console.print(f"[bold bright_cyan]🎙️  [USER SPOKE][/] \"{text}\"")
+
+    def on_state(old_s, new_s):
+        console.print(f"[bold yellow]🔄 [STATE CHANGE][/] {old_s.value} -> [bold green]{new_s.value}[/]")
+
+    def on_dec(dec: FLMDecision, state: VartalapState):
+        color = "cyan" if dec.action == "listen" else ("magenta" if dec.action == "talk" else "yellow")
+        console.print(
+            f"[{color}][DECISION - {state.value}][/] <{dec.action}> "
+            f"| Latency: [bold]{dec.latency_ms:.1f}ms[/] (TTFT: {dec.ttft_ms:.1f}ms) "
+            f"| Utterance: \"{dec.utterance}\""
+        )
+
+    def on_burst(text: str):
+        console.print(f"[bold magenta]🔊 [PIPER TTS PLAYING][/] \"{text}\"")
+
+    harness.stt.on_energy = on_energy
+    harness.stt.on_partial_transcript = on_partial
     harness.on_state_change = on_state
     harness.on_decision = on_dec
     harness.on_tts_burst = on_burst
 
-    harness.start(mic_device=mic_device)
-    console.print("[bold yellow]Vartalap is live! Speak into microphone or press Ctrl+C to stop.[/bold yellow]")
+    console.print("[bold green]Initializing STT audio stream...[/bold green]")
+    try:
+        harness.start(mic_device=mic_device)
+        console.print("[bold yellow]✅ Vartalap is LIVE! Speak into your microphone now (Press Ctrl+C to stop)...[/bold yellow]\n")
+    except Exception as e:
+        console.print(f"[bold red]Failed to start audio stream:[/] {e}")
+        console.print("[yellow]Tip: Run with --list-devices to find the correct mic index and pass --mic <index>[/yellow]")
+        return
 
     try:
         while True:
-            time.sleep(0.2)
+            time.sleep(0.1)
     except KeyboardInterrupt:
-        console.print("\n[bold red]Shutting down Vartalap...[/bold red]")
+        console.print("\n[bold red]Stopping Vartalap...[/bold red]")
     finally:
         harness.stop()
+        console.print("[bold green]Stopped cleanly.[/bold green]")
 
 
 def run_simulation(config: VartalapConfig):
@@ -109,23 +136,16 @@ def run_simulation(config: VartalapConfig):
 
     harness = VartalapStateMachine(config=config, flm=flm, stt=stt, tts=tts)
 
-    last_decision = FLMDecision(action="listen")
-    last_burst = ""
-
     def on_state(old_s, new_s):
         console.print(f"[bold yellow][STATE CHANGE][/] {old_s.value} -> [bold green]{new_s.value}[/]")
 
     def on_dec(dec, state):
-        nonlocal last_decision
-        last_decision = dec
         console.print(
             f"[dim][{state.value}][/dim] FLM Decision: [bold]{dec.action}[/] "
             f"| Latency: {dec.latency_ms:.1f}ms | Utterance: \"{dec.utterance}\""
         )
 
     def on_burst(text):
-        nonlocal last_burst
-        last_burst = text
         console.print(f"[bold magenta][TTS BURST PLAYBACK][/] \"{text}\"")
 
     harness.on_state_change = on_state
@@ -166,18 +186,20 @@ def run_simulation(config: VartalapConfig):
     console.print("[bold green][OK] Simulation complete![/bold green]")
 
 
-
-import threading
-
-
 def main():
     parser = argparse.ArgumentParser(description="Vartalap Conversational Monitor")
     parser.add_argument("--simulate", action="store_true", help="Run simulated end-to-end conversation flow")
+    parser.add_argument("--list-devices", action="store_true", help="List all available audio input and output devices")
+    parser.add_argument("--mic", type=int, default=None, help="Audio input device index")
+    parser.add_argument("--out", type=int, default=None, help="Audio output device index")
     parser.add_argument("--model", type=str, default="gemma4-it:e2b", help="FastFlowLM model tag")
     parser.add_argument("--flm-url", type=str, default="http://127.0.0.1:52625/v1", help="FLM API base URL")
-    parser.add_argument("--mic", type=int, default=None, help="Audio input device index")
 
     args = parser.parse_args()
+
+    if args.list_devices:
+        list_audio_devices()
+        return
 
     config = VartalapConfig(
         model_name=args.model,
@@ -187,7 +209,7 @@ def main():
     if args.simulate:
         run_simulation(config)
     else:
-        run_live(config, mic_device=args.mic)
+        run_live(config, mic_device=args.mic, out_device=args.out)
 
 
 if __name__ == "__main__":
