@@ -146,6 +146,9 @@ def main():
     parser.add_argument("--stt", type=str, default="whisper", choices=["whisper", "sherpa"],
                         help="STT backend: 'whisper' (Faster-Whisper, 220ms, default) or 'sherpa' (Zipformer)")
 
+    parser.add_argument("--ui", action="store_true", help="Launch Vartalap modern web dashboard")
+    parser.add_argument("--port", type=int, default=8000, help="Web dashboard port")
+
     args = parser.parse_args()
 
     if args.list_devices:
@@ -158,7 +161,14 @@ def main():
         stt_backend=args.stt,
     )
 
-    run_live(config, mic_device=args.mic, out_device=args.out)
+    if args.ui:
+        import webbrowser
+        from .web_server import start_server
+        console.print(f"[bold green]Launching Vartalap Web Dashboard on http://127.0.0.1:{args.port}...[/bold green]")
+        threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")).start()
+        start_server(port=args.port)
+    else:
+        run_live(config, mic_device=args.mic, out_device=args.out)
 
 
 if __name__ == "__main__":

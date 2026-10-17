@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vartalap — Real-Time Conversational AI Dashboard</title>
+  <meta name="description" content="Ultra-low latency real-time voice monitor and conversational AI powered by Faster-Whisper, FastFlowLM, and Piper Neural TTS.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="dark-theme">
+  <!-- Dynamic Gradient Mesh Background -->
+  <div class="mesh-bg">
+    <div class="glow-orb glow-1"></div>
+    <div class="glow-orb glow-2"></div>
+    <div class="glow-orb glow-3"></div>
+  </div>
+
+  <div class="app-layout">
+    <!-- Top Navigation Bar -->
+    <header class="top-nav glass-panel">
+      <div class="brand">
+        <div class="logo-mark">
+          <div class="logo-dot"></div>
+          <div class="logo-ring"></div>
+        </div>
+        <div class="brand-text">
+          <h1>VARTALAP</h1>
+          <span class="badge-tag">NPU DUPLEX ENGINE</span>
+        </div>
+      </div>
+
+      <!-- Real-Time State Indicator Pill -->
+      <div class="state-pill-container">
+        <div id="stateIndicator" class="state-pill state-idle">
+          <span class="state-dot"></span>
+          <span id="stateText" class="state-label">IDLE</span>
+        </div>
+      </div>
+
+      <!-- Quick Telemetry Chips -->
+      <div class="nav-metrics">
+        <div class="metric-chip">
+          <span class="metric-label">STT (CPU)</span>
+          <span id="metricStt" class="metric-val text-cyan">~220ms</span>
+        </div>
+        <div class="metric-chip">
+          <span class="metric-label">LLM (NPU)</span>
+          <span id="metricLlm" class="metric-val text-violet">~1.1s</span>
+        </div>
+        <div class="metric-chip">
+          <span class="metric-label">TTS</span>
+          <span id="metricTts" class="metric-val text-emerald">Piper</span>
+        </div>
+        <!-- Live Connection Status -->
+        <div class="connection-status" id="wsStatus" title="WebSocket Status">
+          <span class="conn-dot"></span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Workspace Grid -->
+    <main class="dashboard-grid">
+      <!-- Left Column: Voice Orb & Pipeline State Flow -->
+      <section class="visualizer-column">
+        <!-- Interactive Voice Orb Glass Card -->
+        <div class="card glass-panel orb-card">
+          <div class="card-header">
+            <h3>VOICE ACTIVITY ORB</h3>
+            <span class="card-subtitle" id="orbSubtitle">Awaiting Audio Input</span>
+          </div>
+
+          <!-- Glowing Interactive Canvas Orb -->
+          <div class="orb-container">
+            <canvas id="orbCanvas" width="340" height="340"></canvas>
+            <div class="orb-center-pulse" id="orbPulse"></div>
+          </div>
+
+          <!-- VU Meter & Audio Energy Bar -->
+          <div class="vu-meter-box">
+            <div class="vu-labels">
+              <span>MIC ENERGY</span>
+              <span id="rmsValue">0.0000 RMS</span>
+            </div>
+            <div class="vu-bar-track">
+              <div id="vuFill" class="vu-bar-fill" style="width: 0%;"></div>
+            </div>
+          </div>
+
+          <!-- Primary Control Button -->
+          <div class="controls-action-bar">
+            <button id="toggleBtn" class="btn btn-primary btn-glow">
+              <span class="btn-icon" id="btnIcon">▶</span>
+              <span id="btnText">START VARTALAP</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 4-State Pipeline Visualizer Card -->
+        <div class="card glass-panel state-pipeline-card">
+          <div class="card-header">
+            <h3>4-STATE TURN PIPELINE</h3>
+            <span class="card-subtitle">Zero Inference When Idle</span>
+          </div>
+          <div class="pipeline-flow">
+            <div class="pipeline-step active" id="step-idle">
+              <div class="step-icon">💤</div>
+              <div class="step-info">
+                <h4>1. IDLE</h4>
+                <p>0% NPU inference. Waiting for speech words.</p>
+              </div>
+            </div>
+            <div class="pipeline-connector" id="conn-1"></div>
+            <div class="pipeline-step" id="step-monitoring">
+              <div class="step-icon">👁️</div>
+              <div class="step-info">
+                <h4>2. MONITORING</h4>
+                <p>Continuous streaming. 500ms Gemma evaluation.</p>
+              </div>
+            </div>
+            <div class="pipeline-connector" id="conn-2"></div>
+            <div class="pipeline-step" id="step-talking">
+              <div class="step-icon">🔊</div>
+              <div class="step-info">
+                <h4>3. TALKING</h4>
+                <p>Piper TTS playing response to completion.</p>
+              </div>
+            </div>
+            <div class="pipeline-connector" id="conn-3"></div>
+            <div class="pipeline-step" id="step-arbitration">
+              <div class="step-icon">⚖️</div>
+              <div class="step-info">
+                <h4>4. ARBITRATION</h4>
+                <p>Turn yield check &amp; clean reset to IDLE.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Center/Right Column: Live Transcript & Interaction Stream -->
+      <section class="transcript-column">
+        <div class="card glass-panel transcript-card">
+          <div class="card-header border-bottom">
+            <div class="header-title-group">
+              <h3>LIVE CONVERSATIONAL STREAM</h3>
+              <span class="card-subtitle" id="streamStatus">Continuous Real-Time Duplex Feed</span>
+            </div>
+            <div class="header-actions">
+              <button id="clearChatBtn" class="btn btn-ghost btn-sm" title="Clear transcript">Clear</button>
+            </div>
+          </div>
+
+          <!-- Transcript Scroll Container -->
+          <div class="transcript-feed" id="transcriptFeed">
+            <!-- Welcome placeholder card -->
+            <div class="welcome-banner">
+              <div class="welcome-icon">⚡</div>
+              <h4>Vartalap is Ready</h4>
+              <p>Speak into your microphone to begin. As you speak, Faster-Whisper transcribes in 220ms, and Gemma evaluates on the NPU every tick.</p>
+            </div>
+          </div>
+
+          <!-- Real-Time Live Partial Preview Banner -->
+          <div class="live-partial-bar" id="livePartialBar">
+            <span class="partial-icon">🎙️</span>
+            <span class="partial-label">HEARING:</span>
+            <span class="partial-text" id="partialTranscriptText">...</span>
+          </div>
+
+          <!-- Quick Test Simulation Bar -->
+          <div class="quick-test-bar border-top">
+            <span class="quick-label">QUICK TEST:</span>
+            <button class="chip-btn" data-text="What is the capital of France?">Capital of France</button>
+            <button class="chip-btn" data-text="I was thinking about connecting these two live wires.">Live Wires (Danger)</button>
+            <button class="chip-btn" data-text="What will happen if I put sodium in water?">Sodium in Water</button>
+            <button class="chip-btn" data-text="Hello there, who are you?">Introduce</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: System Status, Audio Devices, & Latency Gauge -->
+      <section class="settings-column">
+        <!-- Hardware Architecture Card -->
+        <div class="card glass-panel hardware-card">
+          <div class="card-header">
+            <h3>DEVICE &amp; HARDWARE STACK</h3>
+          </div>
+          <div class="hw-item">
+            <div class="hw-icon cpu-icon">CPU</div>
+            <div class="hw-details">
+              <strong>AMD Ryzen AI 7 350 (8c/16t)</strong>
+              <span>Faster-Whisper (INT8) + Piper Neural TTS</span>
+            </div>
+          </div>
+          <div class="hw-item">
+            <div class="hw-icon npu-icon">NPU</div>
+            <div class="hw-details">
+              <strong>Qualcomm/Ryzen AI NPU</strong>
+              <span>FastFlowLM (gemma4-it:e2b)</span>
+            </div>
+          </div>
+
+          <!-- Audio Device Selectors -->
+          <div class="device-selectors">
+            <div class="form-group">
+              <label for="micSelect">Input Microphone:</label>
+              <select id="micSelect" class="custom-select">
+                <option value="">Detecting devices...</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="outSelect">Output Speakers / Headset:</label>
+              <select id="outSelect" class="custom-select">
+                <option value="">Detecting devices...</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Latency Breakdown Card -->
+        <div class="card glass-panel latency-card">
+          <div class="card-header">
+            <h3>LATENCY TELEMETRY</h3>
+          </div>
+          <div class="latency-meters">
+            <div class="latency-row">
+              <span class="lat-label">STT Recognition:</span>
+              <div class="lat-track">
+                <div class="lat-bar bar-cyan" id="latBarStt" style="width: 25%;"></div>
+              </div>
+              <span class="lat-num" id="latValStt">220ms</span>
+            </div>
+            <div class="latency-row">
+              <span class="lat-label">LLM Turn Decision:</span>
+              <div class="lat-track">
+                <div class="lat-bar bar-violet" id="latBarLlm" style="width: 55%;"></div>
+              </div>
+              <span class="lat-num" id="latValLlm">1.1s</span>
+            </div>
+            <div class="latency-row">
+              <span class="lat-label">TTS Synthesis:</span>
+              <div class="lat-track">
+                <div class="lat-bar bar-emerald" id="latBarTts" style="width: 15%;"></div>
+              </div>
+              <span class="lat-num" id="latValTts">60ms</span>
+            </div>
+          </div>
+          <div class="total-latency-box">
+            <span>END-TO-END TURN TIME</span>
+            <strong id="totalTurnLatency">~1.4s</strong>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
