@@ -34,6 +34,7 @@ class SherpaSTTStream:
         self._words_arrived_in_window = False
         self.silence_tick_count = 0
         self.last_audio_rms = 0.0
+        self.mute_mic = False
         self._lock = threading.Lock()
 
         # Callbacks
@@ -72,12 +73,17 @@ class SherpaSTTStream:
                 if status:
                     pass
                 if self._running:
+                    # Echo suppression: ignore audio while TTS is actively speaking
+                    if self.mute_mic:
+                        return
+
                     samples = indata[:, 0].copy()
                     rms = float(np.sqrt(np.mean(samples**2)))
                     self.last_audio_rms = rms
                     if self.on_energy:
                         self.on_energy(rms)
                     self._audio_queue.put(samples)
+
 
             self._input_stream = sd.InputStream(
                 samplerate=self.config.sample_rate,

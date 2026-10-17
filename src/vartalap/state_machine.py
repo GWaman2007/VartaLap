@@ -153,7 +153,20 @@ class VartalapStateMachine:
         silence_ticks = self.stt.check_silence_tick()
         current_partial = self.stt.get_current_partial()
 
-        # Prompt Gemma to arbitrate
+        # Check if user spoke any NEW words during playback
+        user_spoke_during_playback = not self.stt.transcript_queue.empty()
+
+        # If user did NOT speak during playback and model already delivered its answer:
+        if not user_spoke_during_playback and self.agent_turn_accumulator:
+            # Model finished answering and user is silent -> yield turn & sleep
+            decision = FLMDecision(action="done", utterance="", raw_response="<done> (turn-yield)")
+            if self.on_decision:
+                self.on_decision(decision, VartalapState.ARBITRATION)
+            self._finalize_turn()
+            self.set_state(VartalapState.IDLE)
+            return
+
+        # Otherwise, user spoke or interrupted -> evaluate Gemma
         decision = self.flm.evaluate(
             history=self.history,
             current_partial_transcript=current_partial,
@@ -165,6 +178,20 @@ class VartalapStateMachine:
             self.on_decision(decision, VartalapState.ARBITRATION)
 
         if decision.action == "talk":
+            new_text = decision.utterance.strip().lower()
+            last_text = self.agent_last_chunk.strip().lower()
+            already_spoken = [x.strip().lower() for x in self.agent_turn_accumulator]
+
+            # Repetition guard: If model repeats the same words, it is done
+            if new_text == last_text or new_text in already_spoken:
+                decision = FLMDecision(action="done", utterance="", raw_response="<done> (repetition-halt)")
+                if self.on_decision:
+                    self.on_decision(decision, VartalapState.ARBITRATION)
+                self._finalize_turn()
+                self.set_state(VartalapState.IDLE)
+                return
+
+
             # Continue speaking next chunk
             self.agent_last_chunk = decision.utterance
             self.agent_turn_accumulator.append(decision.utterance)
@@ -182,20 +209,23 @@ class VartalapStateMachine:
         else:
             # On error or transient state, wait before retrying
             elapsed = time.perf_counter() - t_tick_start
-            sleep_time = max(0.0, (self.config.tick_interval_ms / 1000.0) - elapsed)
+            sleep_time = max(0.2, (self.config.tick_interval_ms / 1000.0) - elapsed)
             time.sleep(sleep_time)
 
-
     def _start_speech_burst(self, text: str):
-        """Initiates Piper TTS playback for 3-4 words."""
+        """Initiates Piper TTS playback for 3-4 words with mic echo muting."""
         self._playback_finished_event.clear()
+        self.stt.mute_mic = True
         if self.on_tts_burst:
             self.on_tts_burst(text)
 
         def on_done():
+            time.sleep(0.15)  # Reverb decay grace period
+            self.stt.mute_mic = False
             self._playback_finished_event.set()
 
         self.tts.play_burst(text, on_complete=on_done)
+
 
     def _finalize_turn(self):
         """Commits full exchange into conversation history and clears buffers."""
