@@ -10,18 +10,11 @@ class VartalapConfig:
     max_tokens: int = 35  # Natural 12-25 word conversational answers
     temperature: float = 0.0  # Deterministic, lowest latency
 
-    # STT Backend: "whisper" (FLM NPU) or "sherpa" (legacy)
-    stt_backend: str = "whisper"
-
-    # Duplex & Barge-In Audio Levels
-    echo_suppression: bool = False  # False for headsets (allows full duplex barge-in)
-    speech_threshold_rms: float = 0.050  # Start VAD speech buffer (background is ~0.038, speech is 0.09-0.20)
-    barge_in_rms_threshold: float = 0.080  # Intentional user interruption threshold during TTS
-    silence_duration_s: float = 0.85  # Natural pause allowance before finalizing utterance (prevents mid-sentence cuts)
-    min_speech_duration_s: float = 0.30  # Minimum speech duration to filter clicks/pops
+    # STT Backend: "sherpa" (CPU streaming, default) or "whisper" (FLM NPU)
+    stt_backend: str = "sherpa"
 
     # State Machine Timing
-    tick_interval_ms: int = 400
+    tick_interval_ms: int = 500  # 500ms evaluation ticks
     silence_threshold_ticks: int = 2
 
     # Audio & STT Settings

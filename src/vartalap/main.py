@@ -52,16 +52,15 @@ def list_audio_devices():
 
 
 def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = None):
-    stt_label = "Whisper-V3 Turbo (NPU)" if config.stt_backend == "whisper" else "Sherpa-ONNX Zipformer"
+    stt_label = "Sherpa-ONNX Zipformer (CPU Streaming)" if config.stt_backend == "sherpa" else "Whisper-V3 Turbo (NPU)"
     console.print(Panel(
-        f"[bold green]Starting Vartalap Conversational Agent[/bold green]\n"
-        f"[dim]Real-time duplex voice harness[/dim]\n"
-        f"[cyan]STT:[/] {stt_label}  •  [cyan]LLM:[/] {config.model_name}  •  [cyan]TTS:[/] Piper Neural\n"
-        f"[cyan]Duplex Mode:[/] Full-duplex with instant barge-in",
+        f"[bold green]Starting Vartalap Conversational Monitor[/bold green]\n"
+        f"[dim]Continuous real-time voice harness[/dim]\n"
+        f"[cyan]STT:[/] {stt_label}  •  [cyan]LLM:[/] {config.model_name}  •  [cyan]TTS:[/] Piper Neural",
         border_style="green"
     ))
 
-    # Set default audio devices in sounddevice
+    # Set audio devices in sounddevice
     if sd is not None:
         default_in, default_out = sd.default.device
         chosen_in = mic_device if mic_device is not None else default_in
@@ -83,7 +82,7 @@ def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = N
     def on_energy(rms: float):
         nonlocal last_rms_log_time
         now = time.perf_counter()
-        if rms > config.barge_in_rms_threshold and (now - last_rms_log_time) > 0.6:
+        if rms > 0.040 and (now - last_rms_log_time) > 0.6:
             bars = min(20, int(rms * 150))
             meter = "|" * bars
             console.print(f"[dim green][MIC ACTIVITY][/] {meter:<20} (RMS: {rms:.4f})")
@@ -112,15 +111,11 @@ def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = N
     def on_burst(text: str):
         console.print(f"[bold magenta]🔊 [TTS PLAYING][/] \"{text}\"")
 
-    def on_barge_in():
-        console.print(f"[bold red]⚡ [BARGE-IN] User interrupted! Instant audio cut-off.[/]")
-
     harness.stt.on_energy = on_energy
     harness.stt.on_partial_transcript = on_partial
     harness.on_state_change = on_state
     harness.on_decision = on_dec
     harness.on_tts_burst = on_burst
-    harness.on_barge_in = on_barge_in
 
     console.print("[bold green]Initializing audio streams...[/bold green]")
     try:
@@ -142,15 +137,14 @@ def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = N
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Vartalap Conversational Agent")
+    parser = argparse.ArgumentParser(description="Vartalap Conversational Monitor")
     parser.add_argument("--list-devices", action="store_true", help="List all available audio input and output devices")
     parser.add_argument("--mic", type=int, default=None, help="Audio input device index")
     parser.add_argument("--out", type=int, default=None, help="Audio output device index")
     parser.add_argument("--model", type=str, default="gemma4-it:e2b", help="FastFlowLM model tag")
     parser.add_argument("--flm-url", type=str, default="http://127.0.0.1:52625/v1", help="FLM API base URL")
-    parser.add_argument("--stt", type=str, default="whisper", choices=["whisper", "sherpa"],
-                        help="STT backend: 'whisper' (FLM NPU, recommended) or 'sherpa' (Sherpa-ONNX)")
-    parser.add_argument("--echo-suppress", action="store_true", help="Enable echo suppression (for loudspeakers; leave off for headphones)")
+    parser.add_argument("--stt", type=str, default="sherpa", choices=["sherpa", "whisper"],
+                        help="STT backend: 'sherpa' (CPU streaming, default) or 'whisper' (FLM NPU)")
 
     args = parser.parse_args()
 
@@ -162,7 +156,6 @@ def main():
         model_name=args.model,
         flm_base_url=args.flm_url,
         stt_backend=args.stt,
-        echo_suppression=args.echo_suppress,
     )
 
     run_live(config, mic_device=args.mic, out_device=args.out)
