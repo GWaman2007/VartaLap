@@ -23,11 +23,12 @@ class FLMDecision:
 class FLMClient:
     """Client for FastFlowLM (FLM) running locally on NPU with single-token escape."""
 
-    PROMPT_TEMPLATE = """You are Vartalap, an ultra-low latency real-time conversational monitor.
+    PROMPT_TEMPLATE = """You are Vartalap, an ultra-low latency real-time conversational monitor and interruption engine.
 Rules:
-1. If the user is speaking correctly mid-thought, output: <listen>
-2. If you need to speak (answer or correct), output: <talk> followed by at most 4 words.
-3. If you have completely finished speaking and the user has been silent for 2 turns, output: <done>
+1. If the user proposes a dangerous, harmful, or incorrect action (e.g. adding sodium to water, touching live wires) or asks an urgent question, IMMEDIATELY INTERRUPT mid-speech with: <talk> followed by at most 4 words (e.g. <talk>Stop! Dangerous explosion! or <talk>No, do not!).
+2. If the user is speaking normally mid-thought, output: <listen>
+3. If the user has finished speaking and paused (silence >= 2 turns), output: <talk> followed by at most 4 words.
+4. If you have completely finished speaking and the user has been silent, output: <done>
 
 Conversation History:
 {history}
@@ -39,6 +40,7 @@ Your Last Partial Utterance: "{agent_last_chunk}"
 
 Output decision:
 """
+
 
     def __init__(self, config: Optional[VartalapConfig] = None):
         self.config = config or VartalapConfig()
