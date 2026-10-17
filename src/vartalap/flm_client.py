@@ -2,7 +2,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import httpx
 
@@ -23,27 +23,27 @@ class FLMDecision:
 class FLMClient:
     """Client for FastFlowLM (FLM) running locally on NPU.
     
-    Uses standard non-streaming HTTP requests to maintain a single persistent,
-    clean connection without socket leaks or connection limit exhaustion.
+    Supports both ultra-fast streaming piece generation with sentence-boundary
+    bursting and robust non-streaming evaluation with persistent keep-alive connections.
     """
 
-    PROMPT_TEMPLATE = """You are Vartalap, a fast real-time conversational voice assistant.
+    PROMPT_TEMPLATE = """You are Vartalap, a fast, helpful real-time conversational voice assistant.
 
 Rules:
-1. SAFETY FIRST: If user proposes something dangerous (live wires, chemicals in water, self-harm), output <talk> with an urgent warning in 10-20 words explaining WHY it is dangerous.
+1. GREETINGS & CHECK-INS: If user greets you ("hello", "hi", "hey") or checks if you can hear them ("can you hear me?", "you hear me?", "are you there?"), ALWAYS output <talk> followed by a warm, direct confirmation.
+   Example: <talk>Hello! Yes, I hear you loud and clear. How can I assist you today?
+2. SAFETY FIRST: If user proposes something dangerous (live wires, chemicals in water, self-harm), output <talk> with an urgent warning in 10-20 words explaining WHY it is dangerous.
    Example: <talk>Stop immediately! Sodium reacts violently with water, causing an explosion, intense heat, and severe burns.
-2. If user utterance is incomplete, trailing off, or mid-thought (e.g. "so like", "what is the...", "can you"), output ONLY: <listen>
-   Do NOT say "please finish your question". Simply output <listen>.
-3. If user says stop, wait, or be quiet, output: <talk>I have stopped. What would you like to know?
-4. If user asked a complete question, output <talk> followed by a concise, natural, direct answer in 10-20 words in complete sentences.
-5. If you already answered and user is silent, output: <done>
+3. COMPLETE QUESTIONS & STATEMENTS: If user asked a question, made a request, or made a statement, output <talk> followed by a concise, direct, helpful answer in 10-25 words in complete sentences.
+4. INCOMPLETE SPEECH: Output ONLY <listen> if the user utterance is clearly cut off mid-sentence (e.g. "and then I went to the...", "because of...").
+5. TURN COMPLETION: Output <done> ONLY when you have already given your complete spoken answer and user has not said anything new.
 
 Conversation History:
 {history}
 
 [Current State]
 User Said: "{current_partial_transcript}"
-User Silence Ticks: {silence_tick_count}
+Agent Already Answered: {agent_has_answered}
 
 Output decision:
 """
@@ -72,20 +72,28 @@ Output decision:
         else:
             clean_history = "None"
 
+        has_answered = "Yes" if agent_last_chunk else "No"
+
         return self.PROMPT_TEMPLATE.format(
             history=clean_history,
             current_partial_transcript=current_partial_transcript.strip(),
-            silence_tick_count=silence_tick_count,
+            agent_has_answered=has_answered,
         )
 
-    def evaluate(
+    def evaluate_stream(
         self,
         history: str,
         current_partial_transcript: str,
         silence_tick_count: int,
         agent_last_chunk: str,
+        on_piece: Optional[Callable[[str], None]] = None,
     ) -> FLMDecision:
-        """Evaluates conversational state cleanly without leaking sockets."""
+        """Evaluates conversational state with streaming token reading and piece bursting.
+        
+        Reads stream completely to [DONE] to ensure zero socket leaks on Windows.
+        As tokens arrive, cuts <talk> responses into natural sentence/clause pieces
+        and emits them via on_piece for instant TTS speech initiation.
+        """
         prompt = self.format_prompt(
             history=history,
             current_partial_transcript=current_partial_transcript,
@@ -94,29 +102,102 @@ Output decision:
         )
 
         t_start = time.perf_counter()
+        first_token_time = None
+        collected_tokens: list[str] = []
+        current_piece: list[str] = []
+        action: Optional[DecisionType] = None
+        tag_buffer = ""
+        in_talk = False
 
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
-            "stream": False,
+            "stream": True,
         }
 
         try:
-            response = self._http_client.post(self.endpoint, json=payload)
+            with self._http_client.stream("POST", self.endpoint, json=payload) as response:
+                if response.status_code != 200:
+                    t_end = time.perf_counter()
+                    return FLMDecision(
+                        action="error",
+                        raw_response=f"HTTP {response.status_code}: {response.text[:200]}",
+                        latency_ms=(t_end - t_start) * 1000,
+                    )
+
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter()
+                            collected_tokens.append(delta)
+
+                            if action is None:
+                                tag_buffer += delta
+                                if "<listen>" in tag_buffer:
+                                    action = "listen"
+                                elif "<done>" in tag_buffer:
+                                    action = "done"
+                                elif "<talk>" in tag_buffer:
+                                    action = "talk"
+                                    in_talk = True
+                                    remainder = tag_buffer.split("<talk>", 1)[1]
+                                    if remainder:
+                                        current_piece.append(remainder)
+                                elif len(tag_buffer) > 15:
+                                    # Fallback if model omitted tag
+                                    action = "talk"
+                                    in_talk = True
+                                    current_piece.append(tag_buffer)
+
+                            elif in_talk:
+                                if "</talk>" in delta or "<done>" in delta:
+                                    in_talk = False
+                                    clean_delta = delta.replace("</talk>", "").replace("<done>", "")
+                                    if clean_delta:
+                                        current_piece.append(clean_delta)
+                                else:
+                                    current_piece.append(delta)
+
+                                piece_str = "".join(current_piece)
+                                # Cut into pieces by clause/sentence boundaries or 7+ words
+                                if on_piece and (any(p in delta for p in [",", ".", "!", "?", ";", "\n"]) or len(piece_str.split()) >= 7):
+                                    chunk_to_speak = piece_str.strip()
+                                    if chunk_to_speak:
+                                        on_piece(chunk_to_speak)
+                                    current_piece = []
+                    except Exception:
+                        pass
+
+            # Emit any remaining text in the piece buffer
+            if on_piece and current_piece:
+                remaining = "".join(current_piece).replace("</talk>", "").replace("<done>", "").strip()
+                if remaining:
+                    on_piece(remaining)
+
             t_end = time.perf_counter()
+            full_text = "".join(collected_tokens).strip()
             latency = (t_end - t_start) * 1000
+            ttft = (first_token_time - t_start) * 1000 if first_token_time else latency
 
-            if response.status_code != 200:
-                return FLMDecision(
-                    action="error",
-                    raw_response=f"HTTP {response.status_code}: {response.text[:200]}",
-                    latency_ms=latency,
-                )
-
-            data = response.json()
-            full_text = data["choices"][0]["message"]["content"].strip()
+            if action == "listen" or "<listen>" in full_text:
+                return FLMDecision(action="listen", utterance="", latency_ms=latency, ttft_ms=ttft, raw_response=full_text)
+            elif action == "done" or "<done>" in full_text:
+                return FLMDecision(action="done", utterance="", latency_ms=latency, ttft_ms=ttft, raw_response=full_text)
+            else:
+                utterance = full_text.replace("<talk>", "").replace("</talk>", "").replace("<done>", "").replace("<listen>", "").strip()
+                return FLMDecision(action="talk", utterance=utterance, latency_ms=latency, ttft_ms=ttft, raw_response=full_text)
 
         except Exception as e:
             t_end = time.perf_counter()
@@ -126,53 +207,21 @@ Output decision:
                 latency_ms=(t_end - t_start) * 1000,
             )
 
-        # Parse decision from response
-        if "<listen>" in full_text:
-            return FLMDecision(
-                action="listen",
-                utterance="",
-                latency_ms=latency,
-                ttft_ms=latency,
-                raw_response=full_text,
-            )
-        elif "<done>" in full_text:
-            return FLMDecision(
-                action="done",
-                utterance="",
-                latency_ms=latency,
-                ttft_ms=latency,
-                raw_response=full_text,
-            )
-        elif "<talk>" in full_text:
-            match = re.search(r"<talk>(.*?)(?:</talk>|\n|$)", full_text, re.DOTALL)
-            utterance = match.group(1).strip() if match else full_text.replace("<talk>", "").strip()
-            utterance = utterance.replace("<done>", "").replace("<listen>", "").replace("</talk>", "").strip()
-            if not utterance:
-                utterance = full_text.replace("<talk>", "").replace("<done>", "").replace("<listen>", "").replace("</talk>", "").strip()
-            return FLMDecision(
-                action="talk",
-                utterance=utterance,
-                latency_ms=latency,
-                ttft_ms=latency,
-                raw_response=full_text,
-            )
-        else:
-            clean_text = full_text.strip()
-            if clean_text:
-                return FLMDecision(
-                    action="talk",
-                    utterance=clean_text,
-                    latency_ms=latency,
-                    ttft_ms=latency,
-                    raw_response=full_text,
-                )
-            return FLMDecision(
-                action="listen",
-                utterance="",
-                latency_ms=latency,
-                ttft_ms=latency,
-                raw_response=full_text,
-            )
+    def evaluate(
+        self,
+        history: str,
+        current_partial_transcript: str,
+        silence_tick_count: int,
+        agent_last_chunk: str,
+    ) -> FLMDecision:
+        """Evaluates conversational state cleanly with streaming token reading."""
+        return self.evaluate_stream(
+            history=history,
+            current_partial_transcript=current_partial_transcript,
+            silence_tick_count=silence_tick_count,
+            agent_last_chunk=agent_last_chunk,
+            on_piece=None,
+        )
 
     def close(self):
         try:

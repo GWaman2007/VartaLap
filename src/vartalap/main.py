@@ -88,11 +88,20 @@ def run_live(config: VartalapConfig, mic_device: int = None, out_device: int = N
             console.print(f"[dim green][MIC ACTIVITY][/] {meter:<20} (RMS: {rms:.4f})")
             last_rms_log_time = now
 
+    last_printed_partial = ""
+
     def on_partial(text: str):
-        console.print(f"[bold bright_cyan]🎙️  [USER SPOKE][/] \"{text}\"")
+        nonlocal last_printed_partial
+        clean = text.strip()
+        if clean and clean != last_printed_partial:
+            console.print(f"[bold bright_cyan]🎙️  [LIVE SPEECH][/] \"{clean}\"")
+            last_printed_partial = clean
 
     def on_state(old_s, new_s):
+        nonlocal last_printed_partial
         console.print(f"[bold yellow]🔄 [STATE CHANGE][/] {old_s.value} -> [bold green]{new_s.value}[/]")
+        if new_s == VartalapState.IDLE:
+            last_printed_partial = ""
 
     def on_dec(dec: FLMDecision, state: VartalapState):
         if dec.action == "error":

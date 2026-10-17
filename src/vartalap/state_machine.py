@@ -86,14 +86,18 @@ class VartalapStateMachine:
     def _run_loop(self):
         """Main event-driven loop executing the 4 states."""
         while self._running:
-            if self.current_state == VartalapState.IDLE:
-                self._handle_idle()
-            elif self.current_state == VartalapState.MONITORING:
-                self._handle_monitoring()
-            elif self.current_state == VartalapState.TALKING:
-                self._handle_talking()
-            elif self.current_state == VartalapState.ARBITRATION:
-                self._handle_arbitration()
+            try:
+                if self.current_state == VartalapState.IDLE:
+                    self._handle_idle()
+                elif self.current_state == VartalapState.MONITORING:
+                    self._handle_monitoring()
+                elif self.current_state == VartalapState.TALKING:
+                    self._handle_talking()
+                elif self.current_state == VartalapState.ARBITRATION:
+                    self._handle_arbitration()
+            except Exception as e:
+                print(f"[State Machine Loop Error]: {e}")
+                time.sleep(0.1)
 
     def _handle_idle(self):
         """STATE: IDLE - Zero NPU/LLM inference. Waits for STT word to arrive."""
@@ -105,17 +109,26 @@ class VartalapStateMachine:
             pass
 
     def _handle_monitoring(self):
-        """STATE: MONITORING - Evaluates streaming audio to decide listen/talk/done."""
+        """STATE: MONITORING - Evaluates streaming audio and triggers burst pieces immediately."""
         t_tick_start = time.perf_counter()
 
         silence_ticks = self.stt.check_silence_tick()
         current_partial = self.stt.get_current_partial()
 
-        decision = self.flm.evaluate(
+        # Stream pieces directly to TTS playback as soon as each sentence/clause is ready
+        def on_burst_piece(piece: str):
+            clean = piece.strip()
+            if clean:
+                self.agent_turn_accumulator.append(clean)
+                self._start_speech_burst(clean)
+                self.set_state(VartalapState.TALKING)
+
+        decision = self.flm.evaluate_stream(
             history=self.history,
             current_partial_transcript=current_partial,
             silence_tick_count=silence_ticks,
             agent_last_chunk=self.agent_last_chunk,
+            on_piece=on_burst_piece,
         )
 
         if self.on_decision:
@@ -128,13 +141,21 @@ class VartalapStateMachine:
 
         elif decision.action == "talk":
             self.agent_last_chunk = decision.utterance
-            self.agent_turn_accumulator.append(decision.utterance)
-            self._start_speech_burst(decision.utterance)
+            # If piece callback didn't trigger, play complete utterance
+            if not self.agent_turn_accumulator and decision.utterance:
+                self.agent_turn_accumulator.append(decision.utterance)
+                self._start_speech_burst(decision.utterance)
             self.set_state(VartalapState.TALKING)
 
         elif decision.action == "done":
-            self._finalize_turn()
-            self.set_state(VartalapState.IDLE)
+            # If the user spoke a query and agent has not answered yet, keep listening
+            if not self.agent_turn_accumulator and current_partial.strip():
+                elapsed = time.perf_counter() - t_tick_start
+                sleep_time = max(0.1, (self.config.tick_interval_ms / 1000.0) - elapsed)
+                time.sleep(sleep_time)
+            else:
+                self._finalize_turn()
+                self.set_state(VartalapState.IDLE)
 
         else:
             elapsed = time.perf_counter() - t_tick_start
@@ -143,8 +164,10 @@ class VartalapStateMachine:
 
     def _handle_talking(self):
         """STATE: TALKING - Play TTS response cleanly to completion without interruptions."""
-        # Wait for speech playback to finish cleanly
-        self._playback_finished_event.wait(timeout=10.0)
+        # Wait for speech playback queue to drain and finish cleanly
+        while self.tts.is_playing:
+            time.sleep(0.05)
+        self._playback_finished_event.wait(timeout=1.0)
         self._playback_finished_event.clear()
 
         # Playback is complete -> transition to ARBITRATION

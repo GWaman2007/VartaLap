@@ -106,13 +106,21 @@ def get_audio_devices():
     return devices, default_in, default_out
 
 
-def init_harness():
+def init_harness(force: bool = False):
     global harness
+    if force and harness is not None:
+        try:
+            harness.stop()
+        except Exception:
+            pass
+        harness = None
+
     if harness is None:
         harness = VartalapStateMachine(config=harness_config)
 
         # Connect hooks to broadcast live updates to WebSocket clients
         last_rms_time = 0.0
+        last_committed_text = ""
 
         def on_energy(rms: float):
             nonlocal last_rms_time
@@ -126,11 +134,25 @@ def init_harness():
             manager.broadcast_sync({"type": "partial_transcript", "text": text})
 
         def on_state(old_s: VartalapState, new_s: VartalapState):
+            nonlocal last_committed_text
             manager.broadcast_sync({"type": "state_change", "state": new_s.value})
+            # When transitioning from MONITORING to TALKING or ARBITRATION, commit user message
+            if old_s == VartalapState.MONITORING and new_s in (VartalapState.TALKING, VartalapState.ARBITRATION):
+                current_p = harness.stt.get_current_partial().strip() if harness else ""
+                if current_p and current_p != last_committed_text:
+                    manager.broadcast_sync({"type": "user_spoke", "text": current_p, "latency_ms": 220})
+                    last_committed_text = current_p
 
         def on_dec(dec: FLMDecision, state: VartalapState):
+            nonlocal last_committed_text
             is_danger = any(w in dec.utterance.lower() for w in ["stop", "danger", "violent", "shock", "burn", "explosion"])
             if dec.action == "talk":
+                # Ensure the user message is committed if not already done
+                current_p = harness.stt.get_current_partial().strip() if harness else ""
+                if current_p and current_p != last_committed_text:
+                    manager.broadcast_sync({"type": "user_spoke", "text": current_p, "latency_ms": 220})
+                    last_committed_text = current_p
+
                 manager.broadcast_sync({
                     "type": "agent_talk",
                     "text": dec.utterance,
@@ -144,22 +166,8 @@ def init_harness():
         def on_burst(text: str):
             pass
 
-        # Also hook user speech commitment
-        def on_user_spoke_hook(text: str, latency_ms: float = 220):
-            manager.broadcast_sync({
-                "type": "user_spoke",
-                "text": text,
-                "latency_ms": latency_ms,
-            })
-
         harness.stt.on_energy = on_energy
-        # Wrap partial callback so when full phrase is ready it fires user_spoke
-        def wrapped_partial(text: str):
-            on_partial(text)
-            if hasattr(harness.stt, "transcript_queue"):
-                manager.broadcast_sync({"type": "user_spoke", "text": text, "latency_ms": 220})
-
-        harness.stt.on_partial_transcript = wrapped_partial
+        harness.stt.on_partial_transcript = on_partial
         harness.on_state_change = on_state
         harness.on_decision = on_dec
         harness.on_tts_burst = on_burst
@@ -207,7 +215,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 action = data.get("action")
 
                 if action == "start":
-                    init_harness()
+                    init_harness(force=not (harness and harness._running))
                     mic = data.get("mic")
                     out = data.get("out")
                     if mic is not None:

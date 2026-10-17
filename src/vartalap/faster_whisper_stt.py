@@ -27,6 +27,8 @@ class FasterWhisperSTTStream:
     SILENCE_DURATION_S = 0.50      # 500ms pause to finalize phrase
     MIN_SPEECH_DURATION_S = 0.25   # Minimum speech duration to transcribe
 
+    STREAM_INTERVAL_S = 0.40      # Transcribe rolling speech every 400ms while speaking
+
     def __init__(self, config: Optional[VartalapConfig] = None):
         self.config = config or VartalapConfig()
         self.transcript_queue: queue.Queue[str] = queue.Queue()
@@ -44,6 +46,8 @@ class FasterWhisperSTTStream:
         self._speech_started = False
         self._speech_start_time = 0.0
         self._last_speech_time = 0.0
+        self._last_stream_time = 0.0
+        self._pushed_word_count = 0
         self._running = False
         self._input_stream = None
 
@@ -57,7 +61,7 @@ class FasterWhisperSTTStream:
         self._lock = threading.Lock()
 
         # Background worker for transcription
-        self._transcribe_queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._transcribe_queue: queue.Queue[tuple[np.ndarray, bool]] = queue.Queue()
         self._worker_thread: Optional[threading.Thread] = None
 
         # Callbacks
@@ -99,7 +103,7 @@ class FasterWhisperSTTStream:
             self._input_stream.start()
 
     def _process_audio_chunk(self, samples: np.ndarray, rms: float):
-        """VAD logic: detect speech start/end and queue completed utterances."""
+        """VAD logic: continuously stream partial audio while user speaks and finalize on pause."""
         now = time.perf_counter()
         is_speech = rms >= self.SPEECH_THRESHOLD
 
@@ -107,37 +111,53 @@ class FasterWhisperSTTStream:
             if not self._speech_started:
                 self._speech_started = True
                 self._speech_start_time = now
+                self._last_stream_time = now
+                self._pushed_word_count = 0
                 self._audio_buffer = []
             self._last_speech_time = now
             self._audio_buffer.append(samples)
+
+            # Continuous streaming: transcribe rolling audio every 400ms while user is speaking
+            if (now - self._last_stream_time) >= self.STREAM_INTERVAL_S and len(self._audio_buffer) >= 3:
+                self._last_stream_time = now
+                rolling_audio = np.concatenate(self._audio_buffer)
+                self._transcribe_queue.put((rolling_audio, False))
 
         elif self._speech_started:
             self._audio_buffer.append(samples)
             speech_duration = now - self._speech_start_time
             silence_duration = now - self._last_speech_time
 
-            # Utterance complete when silence duration is reached
+            # Utterance complete when silence duration is reached (500ms pause)
             if silence_duration >= self.SILENCE_DURATION_S:
                 if speech_duration >= self.MIN_SPEECH_DURATION_S and self._audio_buffer:
                     full_audio = np.concatenate(self._audio_buffer)
-                    self._transcribe_queue.put(full_audio)
+                    self._transcribe_queue.put((full_audio, True))
                 self._speech_started = False
                 self._audio_buffer = []
+                self._pushed_word_count = 0
 
             # Force cutoff on very long speech (10s)
             elif speech_duration >= 10.0:
                 if self._audio_buffer:
                     full_audio = np.concatenate(self._audio_buffer)
-                    self._transcribe_queue.put(full_audio)
+                    self._transcribe_queue.put((full_audio, True))
                 self._speech_started = False
                 self._audio_buffer = []
+                self._pushed_word_count = 0
 
     def _transcription_worker(self):
         """Background thread that transcribes queued audio with faster-whisper."""
         while self._running:
             try:
-                audio = self._transcribe_queue.get(timeout=0.1)
+                item = self._transcribe_queue.get(timeout=0.1)
             except queue.Empty:
+                continue
+
+            audio, is_final = item
+
+            # If another partial chunk is already queued, skip this one to avoid lag
+            if not is_final and not self._transcribe_queue.empty():
                 continue
 
             try:
@@ -160,8 +180,10 @@ class FasterWhisperSTTStream:
                         self._words_arrived_in_window = True
 
                     words = text.split()
-                    for word in words:
+                    new_words = words[self._pushed_word_count:]
+                    for word in new_words:
                         self.transcript_queue.put(word)
+                    self._pushed_word_count = len(words)
 
                     if self.on_partial_transcript:
                         self.on_partial_transcript(text)
@@ -205,6 +227,7 @@ class FasterWhisperSTTStream:
             self._last_emitted_text = ""
             self.silence_tick_count = 0
             self._words_arrived_in_window = False
+            self._pushed_word_count = 0
             while not self.transcript_queue.empty():
                 try:
                     self.transcript_queue.get_nowait()

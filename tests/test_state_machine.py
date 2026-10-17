@@ -30,7 +30,7 @@ def test_monitoring_listen_stay_in_monitoring():
     stt_mock = MagicMock()
     tts_mock = MagicMock()
 
-    flm_mock.evaluate.return_value = FLMDecision(action="listen", utterance="")
+    flm_mock.evaluate_stream.return_value = FLMDecision(action="listen", utterance="")
     stt_mock.check_silence_tick.return_value = 0
     stt_mock.get_current_partial.return_value = "I am thinking about"
 
@@ -47,7 +47,7 @@ def test_monitoring_talk_transition():
     stt_mock = MagicMock()
     tts_mock = MagicMock()
 
-    flm_mock.evaluate.return_value = FLMDecision(action="talk", utterance="Here is your answer")
+    flm_mock.evaluate_stream.return_value = FLMDecision(action="talk", utterance="Here is your answer")
     stt_mock.check_silence_tick.return_value = 2
     stt_mock.get_current_partial.return_value = "What is Vartalap?"
 
@@ -65,7 +65,7 @@ def test_arbitration_done_transition_to_idle():
     stt_mock = MagicMock()
     tts_mock = MagicMock()
 
-    flm_mock.evaluate.return_value = FLMDecision(action="done")
+    flm_mock.evaluate_stream.return_value = FLMDecision(action="done")
     stt_mock.check_silence_tick.return_value = 2
     stt_mock.get_current_partial.return_value = ""
 
